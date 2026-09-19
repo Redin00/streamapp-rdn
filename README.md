@@ -12,6 +12,7 @@ You need Node.js and npm — [install with nvm](https://github.com/nvm-sh/nvm#in
 ```sh
 git clone <this-repository-url>
 cd <repository-name>
+cp .env.example .env
 npm i
 npm run dev
 ```
@@ -26,11 +27,11 @@ run the Python service manually — see
 [`python-service/README.md`](./python-service/README.md) for details.
 
 > [!IMPORTANT]
-> If `SC_ADMIN_PASSWORD` is empty, the service generates a
+> If `SC_ADMIN_PASSWORD` in .env is empty, the service generates a
 > password and prints it to the log **only once**, when the database is created.
 > Save that password or set `SC_ADMIN_PASSWORD` before the first startup.
 
-## Configuration
+## Configuration (.env files)
 
 | Variable             | Default                            | Purpose                                        |
 | -------------------- | ---------------------------------- | ---------------------------------------------- |
