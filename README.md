@@ -1,5 +1,7 @@
 # StreamApp - Rdn
 
+[Italiano](./README.it.md)
+
 A web dashboard for browsing films and series — catalogue, ratings, seasons and
 episodes — through the italian streamingcommunity service, backed by the
 [`streamingcommunity-unofficialapi`](https://pypi.org/project/streamingcommunity-unofficialapi/)
@@ -30,6 +32,10 @@ run the Python service manually — see
 > If `SC_ADMIN_PASSWORD` in .env is empty, the service generates a
 > password and prints it to the log **only once**, when the database is created.
 > Save that password or set `SC_ADMIN_PASSWORD` before the first startup.
+
+> [!NOTE]
+> The StreamingCommunity and Vixsrc domains can rotate over time. Both domains
+> can be changed from the admin panel in the website without restarting the service.
 
 ## Configuration (.env files)
 
