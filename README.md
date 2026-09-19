@@ -25,7 +25,8 @@ server, and connects them automatically via `STREAMING_API_URL`. You can still
 run the Python service manually — see
 [`python-service/README.md`](./python-service/README.md) for details.
 
-> **Important:** If `SC_ADMIN_PASSWORD` is empty, the service generates a
+> [!IMPORTANT]
+> If `SC_ADMIN_PASSWORD` is empty, the service generates a
 > password and prints it to the log **only once**, when the database is created.
 > Save that password or set `SC_ADMIN_PASSWORD` before the first startup.
 
