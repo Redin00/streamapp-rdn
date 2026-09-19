@@ -1,7 +1,7 @@
 # StreamApp - Rdn
 
 A web dashboard for browsing films and series — catalogue, ratings, seasons and
-episodes — backed by the
+episodes — through the italian streamingcommunity service, backed by the
 [`streamingcommunity-unofficialapi`](https://pypi.org/project/streamingcommunity-unofficialapi/)
 Python library, with playback through an embedded player.
 
@@ -25,6 +25,10 @@ server, and connects them automatically via `STREAMING_API_URL`. You can still
 run the Python service manually — see
 [`python-service/README.md`](./python-service/README.md) for details.
 
+> **Important:** If `SC_ADMIN_PASSWORD` is empty, the service generates a
+> password and prints it to the log **only once**, when the database is created.
+> Save that password or set `SC_ADMIN_PASSWORD` before the first startup.
+
 ## Configuration
 
 | Variable             | Default                            | Purpose                                        |
@@ -34,9 +38,10 @@ run the Python service manually — see
 | `SC_LOG_LEVEL`       | `INFO`                             | Python service log level (`DEBUG` for more)    |
 | `SC_DB_PATH`         | `python-service/data/streamapp.db` | Accounts, sessions, library and history        |
 | `SC_ADMIN_NAME`      | `Admin`                            | Name of the first admin profile                |
-| `SC_ADMIN_PASSWORD`  | generated and logged               | Its password, printed once on a fresh database |
+| `SC_ADMIN_PASSWORD`  | generated and logged               | Password for the first admin profile           |
 | `SC_SESSION_DAYS`    | `30`                               | How long a session token stays valid           |
 | `SC_LOCKOUT_MINUTES` | `15`                               | Lockout after five failed sign-ins             |
+| `SC_BASE_URL`        | empty                              | Public base URL used for profile picture links |
 
 The catalogue and playback domains default to values in `python-service/main.py`
 and can be changed from the admin panel without restarting the service.
