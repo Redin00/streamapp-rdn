@@ -1,4 +1,4 @@
-# StreamApp - Rdn
+# 📺 StreamApp - Rdn
 
 [Italiano](./README.it.md)
 
