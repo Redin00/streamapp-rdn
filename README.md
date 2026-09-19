@@ -10,8 +10,8 @@ Python library, with playback through an embedded player.
 You need Node.js and npm — [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating) — plus Python 3.10+.
 
 ```sh
-git clone <this-repository-url>
-cd <repository-name>
+git clone https://github.com/Redin00/streamapp-rdn
+cd streamapp-rdn/
 cp .env.example .env
 npm i
 npm run dev
