@@ -33,3 +33,39 @@ export const updateDomainSettings = createServerFn({ method: "POST" })
       return { ok: false, message: messageFor(error) };
     }
   });
+
+export type DomainCheckDetail = {
+  checked: boolean;
+  redirected: boolean;
+  previousDomain?: string;
+  currentDomain?: string;
+  error?: string;
+};
+
+export type CheckRedirectResult = {
+  checked: boolean;
+  redirected: boolean;
+  previousDomain?: string;
+  currentDomain?: string;
+  previousVixsrcDomain?: string;
+  currentVixsrcDomain?: string;
+  sc?: DomainCheckDetail;
+  vixsrc?: DomainCheckDetail;
+  error?: string;
+};
+
+export const checkDomainRedirect = createServerFn({ method: "POST" }).handler(
+  async (): Promise<CheckRedirectResult> => {
+    try {
+      return await serviceFetch<CheckRedirectResult>("/settings/domains/check-redirect", {
+        method: "POST",
+      });
+    } catch (error) {
+      return {
+        checked: false,
+        redirected: false,
+        error: messageFor(error),
+      };
+    }
+  },
+);

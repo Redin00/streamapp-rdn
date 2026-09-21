@@ -36,6 +36,8 @@ run the Python service manually — see
 > [!NOTE]
 > The StreamingCommunity and Vixsrc domains can rotate over time. Both domains
 > can be changed from the admin panel in the website without restarting the service.
+> Also, streamingcommunity and vixsrc domains update automatically through a redirect
+> automatic controll performed by the backend.
 
 ## Configuration (.env files)
 

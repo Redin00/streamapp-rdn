@@ -146,16 +146,15 @@ export const removeFromHistory = createServerFn({ method: "POST" })
  * replay update the existing row instead of adding another.
  */
 export const recordPlay = createServerFn({ method: "POST" })
-  .validator(
-    (data) =>
-      z
-        .object({
-          slug: z.string().min(1).max(200),
-          title: titleSummary,
-          season: z.number().int().min(0).max(1000).optional(),
-          episode: z.number().int().min(0).max(10000).optional(),
-        })
-        .parse(data),
+  .validator((data) =>
+    z
+      .object({
+        slug: z.string().min(1).max(200),
+        title: titleSummary,
+        season: z.number().int().min(0).max(1000).optional(),
+        episode: z.number().int().min(0).max(10000).optional(),
+      })
+      .parse(data),
   )
   .handler(async ({ data }): Promise<{ ok: boolean }> => {
     try {
@@ -177,15 +176,14 @@ export const recordPlay = createServerFn({ method: "POST" })
 
 /** The resume marker (seconds watched) for one title/season/episode. */
 export const getWatchMarker = createServerFn({ method: "GET" })
-  .validator(
-    (data) =>
-      z
-        .object({
-          slug: z.string().min(1).max(200),
-          season: z.number().int().min(0).max(1000).optional(),
-          episode: z.number().int().min(0).max(10000).optional(),
-        })
-        .parse(data),
+  .validator((data) =>
+    z
+      .object({
+        slug: z.string().min(1).max(200),
+        season: z.number().int().min(0).max(1000).optional(),
+        episode: z.number().int().min(0).max(10000).optional(),
+      })
+      .parse(data),
   )
   .handler(async ({ data }): Promise<{ marker: number } | null> => {
     try {
@@ -229,17 +227,16 @@ export const getWatchMarker = createServerFn({ method: "GET" })
 
 /** Record or update the resume marker for one title/season/episode. */
 export const updateWatchMarker = createServerFn({ method: "POST" })
-  .validator(
-    (data) =>
-      z
-        .object({
-          slug: z.string().min(1).max(200),
-          title: titleSummary,
-          season: z.number().int().min(0).max(1000).optional(),
-          episode: z.number().int().min(0).max(10000).optional(),
-          marker: z.number().int().min(0).max(2_147_483_647),
-        })
-        .parse(data),
+  .validator((data) =>
+    z
+      .object({
+        slug: z.string().min(1).max(200),
+        title: titleSummary,
+        season: z.number().int().min(0).max(1000).optional(),
+        episode: z.number().int().min(0).max(10000).optional(),
+        marker: z.number().int().min(0).max(2_147_483_647),
+      })
+      .parse(data),
   )
   .handler(async ({ data }): Promise<{ ok: boolean; marker: number }> => {
     const season = data.season ?? 0;
@@ -296,23 +293,27 @@ export const formatWatchPosition = (marker: number): string => {
 };
 
 /** Reset the entire watch-tracking state (dev / testing helper). */
-export const clearAllHistory = createServerFn({ method: "POST" })
-  .handler(async () => {
-    mockHistory.length = 0;
-    return { ok: true };
-  });
+export const clearAllHistory = createServerFn({ method: "POST" }).handler(
+  async (): Promise<{ ok: boolean; message?: string }> => {
+    try {
+      mockHistory.length = 0;
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, message: messageFor(error) };
+    }
+  },
+);
 
 /** Remove one resume marker from the service and local fallback stores. */
 export const removeWatchMarker = createServerFn({ method: "POST" })
-  .validator(
-    (data) =>
-      z
-        .object({
-          slug: z.string().min(1).max(200),
-          season: z.number().int().min(0).max(1000).optional(),
-          episode: z.number().int().min(0).max(10000).optional(),
-        })
-        .parse(data),
+  .validator((data) =>
+    z
+      .object({
+        slug: z.string().min(1).max(200),
+        season: z.number().int().min(0).max(1000).optional(),
+        episode: z.number().int().min(0).max(10000).optional(),
+      })
+      .parse(data),
   )
   .handler(async ({ data }): Promise<{ ok: boolean }> => {
     const season = data.season ?? 0;
@@ -343,8 +344,13 @@ export const removeWatchMarker = createServerFn({ method: "POST" })
   });
 
 /** Clear the whole library mock store (admin helper). */
-export const clearAllLibrary = createServerFn({ method: "POST" })
-  .handler(async () => {
-    mockLibrary.length = 0;
-    return { ok: true };
-  });
+export const clearAllLibrary = createServerFn({ method: "POST" }).handler(
+  async (): Promise<{ ok: boolean; message?: string }> => {
+    try {
+      mockLibrary.length = 0;
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, message: messageFor(error) };
+    }
+  },
+);

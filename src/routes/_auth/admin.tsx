@@ -1,6 +1,16 @@
 import { queryOptions, useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
 import { createFileRoute, redirect } from "@tanstack/react-router";
-import { KeyRound, LockOpen, Pencil, Trash2, UserPlus, Camera, Loader2, Globe } from "lucide-react";
+import {
+  KeyRound,
+  LockOpen,
+  Pencil,
+  Trash2,
+  UserPlus,
+  Camera,
+  Loader2,
+  Globe,
+  RefreshCw,
+} from "lucide-react";
 import { type FormEvent, useState } from "react";
 import { useTranslation } from "@/lib/i18n-hook";
 
@@ -46,6 +56,7 @@ import {
 import { clearAllHistory, clearAllLibrary } from "@/lib/library.functions";
 import type { AccountRow, Role } from "@/lib/auth/types";
 import {
+  checkDomainRedirect,
   getDomainSettings,
   updateDomainSettings,
   type DomainSettings,
@@ -97,9 +108,78 @@ function AdminPage() {
   const [clearingAll, setClearingAll] = useState(false);
   const [clearDialogOpen, setClearDialogOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [checkingRedirect, setCheckingRedirect] = useState(false);
+  const [redirectMessage, setRedirectMessage] = useState<{
+    type: "success" | "info" | "error";
+    text: string;
+  } | null>(null);
+
+  async function handleCheckRedirect() {
+    setCheckingRedirect(true);
+    setRedirectMessage(null);
+    setError(null);
+    try {
+      const result = await checkDomainRedirect();
+      if (result.checked) {
+        await queryClient.invalidateQueries({ queryKey: domainSettingsQuery.queryKey });
+        if (result.redirected) {
+          const scChanged = result.sc?.redirected && result.sc.currentDomain;
+          const vixChanged = result.vixsrc?.redirected && result.vixsrc.currentDomain;
+
+          let msg = "";
+          if (scChanged && vixChanged) {
+            msg = t("admin_domainsRedirectDetectedBoth")
+              .replace("{scDomain}", result.sc?.currentDomain ?? "")
+              .replace("{vixsrcDomain}", result.vixsrc?.currentDomain ?? "");
+          } else if (scChanged) {
+            msg = t("admin_domainsRedirectDetectedSc").replace(
+              "{domain}",
+              result.sc?.currentDomain ?? "",
+            );
+          } else if (vixChanged) {
+            msg = t("admin_domainsRedirectDetectedVixsrc").replace(
+              "{domain}",
+              result.vixsrc?.currentDomain ?? "",
+            );
+          } else {
+            msg = t("admin_domainsRedirectDetected").replace(
+              "{domain}",
+              result.currentDomain ?? "",
+            );
+          }
+
+          setRedirectMessage({
+            type: "success",
+            text: msg,
+          });
+        } else {
+          setRedirectMessage({
+            type: "info",
+            text: t("admin_domainsNoRedirect"),
+          });
+        }
+      } else {
+        setRedirectMessage({
+          type: "error",
+          text: t("admin_domainsRedirectError").replace("{error}", result.error ?? t("misc_error")),
+        });
+      }
+    } catch (err: unknown) {
+      setRedirectMessage({
+        type: "error",
+        text: t("admin_domainsRedirectError").replace(
+          "{error}",
+          err instanceof Error ? err.message : t("misc_error"),
+        ),
+      });
+    } finally {
+      setCheckingRedirect(false);
+    }
+  }
 
   async function handleDomainSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    setRedirectMessage(null);
     const form = event.currentTarget;
     const scDomain = (form.elements.namedItem("scDomain") as HTMLInputElement).value;
     const vixsrcDomain = (form.elements.namedItem("vixsrcDomain") as HTMLInputElement).value;
@@ -109,7 +189,11 @@ function AdminPage() {
       return;
     }
     await queryClient.invalidateQueries({ queryKey: domainSettingsQuery.queryKey });
-    setError(t("admin_domainsSaved"));
+    setError(null);
+    setRedirectMessage({
+      type: "success",
+      text: t("admin_domainsSaved"),
+    });
   }
 
   function refresh() {
@@ -205,7 +289,7 @@ function AdminPage() {
     const libraryResult = await clearAllLibrary();
     if (!historyResult.ok || !libraryResult.ok) {
       setError(
-        historyResult.ok ? libraryResult.message : (historyResult.message ?? t("misc_error")),
+        (!historyResult.ok ? historyResult.message : libraryResult.message) ?? t("misc_error"),
       );
       setClearingAll(false);
       return;
@@ -282,6 +366,7 @@ function AdminPage() {
           <div className="space-y-2">
             <Label htmlFor="admin-scDomain">{t("admin_catalogueDomain")}</Label>
             <Input
+              key={(domainSettings as DomainSettings).scDomain}
               id="admin-scDomain"
               name="scDomain"
               defaultValue={(domainSettings as DomainSettings).scDomain}
@@ -293,6 +378,7 @@ function AdminPage() {
           <div className="space-y-2">
             <Label htmlFor="admin-vixsrcDomain">{t("admin_playbackDomain")}</Label>
             <Input
+              key={(domainSettings as DomainSettings).vixsrcDomain}
               id="admin-vixsrcDomain"
               name="vixsrcDomain"
               defaultValue={(domainSettings as DomainSettings).vixsrcDomain}
@@ -301,12 +387,46 @@ function AdminPage() {
               required
             />
           </div>
-          <div className="sm:col-span-2">
+
+          {redirectMessage ? (
+            <div
+              className={`sm:col-span-2 rounded-lg border p-3 text-sm ${
+                redirectMessage.type === "success"
+                  ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
+                  : redirectMessage.type === "error"
+                    ? "border-destructive/50 bg-destructive/10 text-destructive"
+                    : "border-sky-500/40 bg-sky-500/10 text-sky-400"
+              }`}
+            >
+              {redirectMessage.text}
+            </div>
+          ) : null}
+
+          <div className="flex flex-wrap items-center gap-3 sm:col-span-2">
             <Button type="submit" className="gap-2">
               <Globe className="size-4" />
               {t("admin_domainsSave")}
             </Button>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={handleCheckRedirect}
+              disabled={checkingRedirect}
+              className="gap-2"
+            >
+              {checkingRedirect ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <RefreshCw className="size-4" />
+              )}
+              {checkingRedirect
+                ? t("admin_domainsCheckingRedirect")
+                : t("admin_domainsCheckRedirect")}
+            </Button>
           </div>
+          <p className="text-xs text-muted-foreground sm:col-span-2">
+            {t("admin_domainsAutoRedirectNote")}
+          </p>
         </form>
       </div>
 

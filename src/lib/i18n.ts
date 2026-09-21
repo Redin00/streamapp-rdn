@@ -215,6 +215,7 @@ export const EN = {
   admin_clearAllDataDescription:
     "This will permanently delete every user's library and viewing history. This action cannot be undone.",
   admin_clearAllDataConfirm: "Yes, clear all data",
+  admin_showing: "Showing",
   admin_of: "of",
   admin_usersShown: "users.",
   admin_clearedAllData: "All data cleared.",
@@ -224,6 +225,17 @@ export const EN = {
   admin_playbackDomain: "Playback domain",
   admin_domainsSave: "Save domains",
   admin_domainsSaved: "Domains updated successfully.",
+  admin_domainsCheckRedirect: "Check redirects",
+  admin_domainsCheckingRedirect: "Checking redirects...",
+  admin_domainsRedirectDetected: "Redirect detected: domain updated to {domain}.",
+  admin_domainsRedirectDetectedBoth:
+    "Redirects detected: catalogue domain updated to {scDomain}, playback domain to {vixsrcDomain}.",
+  admin_domainsRedirectDetectedSc: "Redirect detected: catalogue domain updated to {domain}.",
+  admin_domainsRedirectDetectedVixsrc: "Redirect detected: playback domain updated to {domain}.",
+  admin_domainsNoRedirect: "No redirects detected: current domains are active.",
+  admin_domainsRedirectError: "Unable to verify redirects: {error}.",
+  admin_domainsAutoRedirectNote:
+    "Catalogue and playback domains are automatically checked and updated if redirected by upstream providers.",
 } as const;
 export const IT = {
   nav_browse: "Esplora",
@@ -430,18 +442,31 @@ export const IT = {
     "StreamApp - Rdn - dati di catalogo serviti tramite il tuo servizio StreamingCommunity.",
   titlecard_film: "Film",
   titlecard_series: "Serie",
-  adblock_forBrowser: "per ",
+  admin_clearAllDataConfirm: "Sì, cancella tutti i dati",
   admin_clearedAllData: "Tutti i dati sono stati cancellati.",
   admin_clearAllData: "Cancella tutti i dati",
   admin_clearAllDataTitle: "Cancellare tutti i dati degli utenti?",
   admin_clearAllDataDescription:
     "Questa operazione eliminerà definitivamente la libreria e la cronologia di ogni utente. Non può essere annullata.",
-  admin_clearAllDataConfirm: "Sì, cancella tutti i dati",
+  adblock_forBrowser: "per ",
   admin_domainsTitle: "Domini di streaming",
   admin_domainsDescription: "Cambia gli host upstream senza riavviare il servizio.",
   admin_catalogueDomain: "Dominio del catalogo",
   admin_playbackDomain: "Dominio di riproduzione",
   admin_domainsSave: "Salva domini",
   admin_domainsSaved: "Domini aggiornati con successo.",
+  admin_domainsCheckRedirect: "Verifica reindirizzamenti",
+  admin_domainsCheckingRedirect: "Verifica in corso...",
+  admin_domainsRedirectDetected: "Reindirizzamento rilevato: dominio aggiornato a {domain}.",
+  admin_domainsRedirectDetectedBoth:
+    "Reindirizzamenti rilevati: dominio catalogo aggiornato a {scDomain}, dominio riproduzione a {vixsrcDomain}.",
+  admin_domainsRedirectDetectedSc:
+    "Reindirizzamento rilevato: dominio catalogo aggiornato a {domain}.",
+  admin_domainsRedirectDetectedVixsrc:
+    "Reindirizzamento rilevato: dominio riproduzione aggiornato a {domain}.",
+  admin_domainsNoRedirect: "Nessun reindirizzamento rilevato: i domini attuali sono attivi.",
+  admin_domainsRedirectError: "Impossibile verificare i reindirizzamenti: {error}.",
+  admin_domainsAutoRedirectNote:
+    "I domini del catalogo e di riproduzione vengono controllati e aggiornati automaticamente se reindirizzati dai provider.",
 } as const;
 export type Translations = typeof EN;

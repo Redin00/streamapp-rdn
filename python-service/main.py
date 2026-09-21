@@ -42,6 +42,8 @@ Run:
 Then point the dashboard at it:  STREAMING_API_URL=http://localhost:8000
 """
 
+import asyncio
+from contextlib import asynccontextmanager
 import json
 import logging
 import os
@@ -49,6 +51,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import requests
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
@@ -103,24 +106,6 @@ _PROFILE_PICTURES_DIR.mkdir(parents=True, exist_ok=True)
 # Defaults to the request's base_url for local dev convenience.
 SC_BASE_URL = os.environ.get("SC_BASE_URL")
 
-app = FastAPI(title="StreamApp - Rdn API", version="1.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
-app.include_router(auth_router)
-app.include_router(library_router)
-
-# Serve uploaded profile pictures under the /profile-pictures path.
-app.mount(
-    "/profile-pictures",
-    StaticFiles(directory=str(_PROFILE_PICTURES_DIR), follow_symlink=True),
-    name="profile_pictures",
-)
-
 # Import time, so the schema and the first admin exist before the first request.
 init_db()
 SC_DOMAIN = get_setting("sc_domain", os.environ.get("SC_DOMAIN", DEFAULT_SC_DOMAIN)).strip()
@@ -153,6 +138,270 @@ def configure_domains(sc_domain: str, vixsrc_domain: str) -> None:
 
 def current_domains() -> tuple[str, str]:
     return get_setting("sc_domain", SC_DOMAIN), get_setting("vixsrc_domain", VIXSRC_DOMAIN)
+
+
+BLOCKED_HOST_PATTERNS = (
+    "block.",
+    "gov.it",
+    "agcom.it",
+    "poliziadistato.it",
+    "gdf.gov.it",
+    "guardiadifinanza",
+    "stop-piracy",
+    "localhost",
+    "127.0.0.1",
+    "0.0.0.0",
+)
+
+
+def _is_valid_sc_redirect(target_host: str, page_content: str = "") -> bool:
+    host = target_host.strip().lower()
+    if not host or "/" in host or " " in host or "." not in host:
+        return False
+    for blocked in BLOCKED_HOST_PATTERNS:
+        if blocked in host:
+            return False
+    if "streamingcommunity" in host:
+        return True
+    content_lower = page_content.lower()
+    if "streamingcommunity" in content_lower or "vixcloud" in content_lower:
+        return True
+    return False
+
+
+def check_domain_redirect(target_domain: Optional[str] = None) -> Dict[str, Any]:
+    """Check if the StreamingCommunity domain redirects to a new domain and update if so."""
+    current = (target_domain or SC_DOMAIN).strip().lower()
+    if not current:
+        return {
+            "checked": False,
+            "redirected": False,
+            "previousDomain": "",
+            "currentDomain": "",
+            "error": "no domain configured",
+        }
+
+    headers = {"user-agent": api.user_agent if api else "Mozilla/5.0"}
+    res = None
+    last_err: Optional[Exception] = None
+
+    # Try HTTPS first; fallback to HTTP if SSL error or connection issue
+    for scheme in ("https", "http"):
+        url = f"{scheme}://{current}"
+        try:
+            res = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+            break
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as exc:
+            last_err = exc
+            log.debug("check_domain_redirect %s failed with %s, trying fallback", url, exc)
+            continue
+        except requests.RequestException as exc:
+            last_err = exc
+            break
+
+    if res is None:
+        log.warning("check_domain_redirect failed for %s: %s", current, last_err)
+        return {
+            "checked": False,
+            "redirected": False,
+            "previousDomain": current,
+            "currentDomain": SC_DOMAIN,
+            "error": str(last_err),
+        }
+
+    final_host = urlparse(res.url).netloc.split(":")[0].strip().lower()
+    if final_host and final_host != current:
+        content_sample = res.text[:2000] if hasattr(res, "text") else ""
+        if _is_valid_sc_redirect(final_host, content_sample):
+            log.info(
+                "Domain redirect detected: %s -> %s. Updating catalogue domain.",
+                current,
+                final_host,
+            )
+            set_setting("sc_domain", final_host)
+            configure_domains(final_host, VIXSRC_DOMAIN)
+            return {
+                "checked": True,
+                "redirected": True,
+                "previousDomain": current,
+                "currentDomain": final_host,
+            }
+        else:
+            log.warning(
+                "Redirected to invalid or blocked host %s from %s, ignoring.",
+                final_host,
+                current,
+            )
+            return {
+                "checked": True,
+                "redirected": False,
+                "previousDomain": current,
+                "currentDomain": current,
+                "error": f"Redirected to untrusted or blocked host: {final_host}",
+            }
+
+    return {
+        "checked": True,
+        "redirected": False,
+        "previousDomain": current,
+        "currentDomain": SC_DOMAIN,
+    }
+
+
+def _is_valid_vixsrc_redirect(target_host: str, page_content: str = "") -> bool:
+    host = target_host.strip().lower()
+    if not host or "/" in host or " " in host or "." not in host:
+        return False
+    for blocked in BLOCKED_HOST_PATTERNS:
+        if blocked in host:
+            return False
+    if "vix" in host:
+        return True
+    content_lower = page_content.lower()
+    if "vixsrc" in content_lower or "vixcloud" in content_lower or "_next" in content_lower:
+        return True
+    return False
+
+
+def check_vixsrc_redirect(target_domain: Optional[str] = None) -> Dict[str, Any]:
+    """Check if the Vixsrc playback domain redirects to a new domain and update if so."""
+    current = (target_domain or VIXSRC_DOMAIN).strip().lower()
+    if not current:
+        return {
+            "checked": False,
+            "redirected": False,
+            "previousDomain": "",
+            "currentDomain": "",
+            "error": "no playback domain configured",
+        }
+
+    headers = {"user-agent": vixsrc_session.headers.get("user-agent", "Mozilla/5.0")}
+    res = None
+    last_err: Optional[Exception] = None
+
+    for scheme in ("https", "http"):
+        url = f"{scheme}://{current}"
+        try:
+            res = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+            break
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as exc:
+            last_err = exc
+            log.debug("check_vixsrc_redirect %s failed with %s, trying fallback", url, exc)
+            continue
+        except requests.RequestException as exc:
+            last_err = exc
+            break
+
+    if res is None:
+        log.warning("check_vixsrc_redirect failed for %s: %s", current, last_err)
+        return {
+            "checked": False,
+            "redirected": False,
+            "previousDomain": current,
+            "currentDomain": VIXSRC_DOMAIN,
+            "error": str(last_err),
+        }
+
+    final_host = urlparse(res.url).netloc.split(":")[0].strip().lower()
+    if final_host and final_host != current:
+        content_sample = res.text[:2000] if hasattr(res, "text") else ""
+        if _is_valid_vixsrc_redirect(final_host, content_sample):
+            log.info(
+                "Vixsrc domain redirect detected: %s -> %s. Updating playback domain.",
+                current,
+                final_host,
+            )
+            set_setting("vixsrc_domain", final_host)
+            configure_domains(SC_DOMAIN, final_host)
+            return {
+                "checked": True,
+                "redirected": True,
+                "previousDomain": current,
+                "currentDomain": final_host,
+            }
+        else:
+            log.warning(
+                "Vixsrc redirected to invalid or blocked host %s from %s, ignoring.",
+                final_host,
+                current,
+            )
+            return {
+                "checked": True,
+                "redirected": False,
+                "previousDomain": current,
+                "currentDomain": current,
+                "error": f"Redirected to untrusted or blocked host: {final_host}",
+            }
+
+    return {
+        "checked": True,
+        "redirected": False,
+        "previousDomain": current,
+        "currentDomain": VIXSRC_DOMAIN,
+    }
+
+
+def check_all_domains_redirect() -> Dict[str, Any]:
+    sc_res = check_domain_redirect()
+    vix_res = check_vixsrc_redirect()
+    any_redirected = sc_res.get("redirected", False) or vix_res.get("redirected", False)
+    all_checked = sc_res.get("checked", False) and vix_res.get("checked", False)
+    errors = [e for e in [sc_res.get("error"), vix_res.get("error")] if e]
+    return {
+        "checked": all_checked or sc_res.get("checked", False) or vix_res.get("checked", False),
+        "redirected": any_redirected,
+        "sc": sc_res,
+        "vixsrc": vix_res,
+        "error": "; ".join(errors) if errors else None,
+        "currentDomain": sc_res.get("currentDomain", SC_DOMAIN),
+        "previousDomain": sc_res.get("previousDomain", SC_DOMAIN),
+        "currentVixsrcDomain": vix_res.get("currentDomain", VIXSRC_DOMAIN),
+        "previousVixsrcDomain": vix_res.get("previousDomain", VIXSRC_DOMAIN),
+    }
+
+
+async def periodic_domain_check() -> None:
+    # Run 5s after startup, then every 30 minutes
+    await asyncio.sleep(5)
+    while True:
+        try:
+            log.debug("Running periodic catalogue and playback domain redirect check...")
+            await asyncio.to_thread(check_all_domains_redirect)
+        except Exception as exc:
+            log.warning("Periodic domain redirect check error: %s", exc)
+        await asyncio.sleep(1800)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(periodic_domain_check())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="StreamApp - Rdn API", version="1.0.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+app.include_router(auth_router)
+app.include_router(library_router)
+
+# Serve uploaded profile pictures under the /profile-pictures path.
+app.mount(
+    "/profile-pictures",
+    StaticFiles(directory=str(_PROFILE_PICTURES_DIR), follow_symlink=True),
+    name="profile_pictures",
+)
 
 
 def cached(key: str, producer):
@@ -320,8 +569,26 @@ def browse(slider: str, limit: int = 24) -> List[Dict[str, Any]]:
     try:
         res = requests.get(url, headers=JSON_HEADERS, timeout=20)
     except requests.RequestException:
-        log.exception("browse request to %s failed", url)
-        raise
+        log.warning("browse request to %s failed, checking domain redirect", url)
+        check = check_domain_redirect()
+        if check.get("redirected"):
+            url = f"https://{SC_DOMAIN}/it/browse/{slider}"
+            log.info("retrying browse GET %s with new domain", url)
+            res = requests.get(url, headers=JSON_HEADERS, timeout=20)
+        else:
+            raise
+
+    final_host = urlparse(res.url).netloc.split(":")[0].strip().lower()
+    if (
+        final_host
+        and final_host != SC_DOMAIN.lower()
+        and _is_valid_sc_redirect(final_host, res.text[:2000] if hasattr(res, "text") else "")
+    ):
+        log.info(
+            "browse followed redirect: %s -> %s; updating catalogue domain", SC_DOMAIN, final_host
+        )
+        set_setting("sc_domain", final_host)
+        configure_domains(final_host, VIXSRC_DOMAIN)
 
     log.debug("browse %s -> status=%s bytes=%d", url, res.status_code, len(res.content))
     if res.status_code != 200:
@@ -344,7 +611,30 @@ def archive_total(media_type: Optional[str] = None) -> int:
     url = f"https://{SC_DOMAIN}/it/archive"
     params = {"type": media_type} if media_type else {}
     log.debug("archive GET %s params=%s", url, params)
-    res = requests.get(url, params=params, headers=JSON_HEADERS, timeout=20)
+    try:
+        res = requests.get(url, params=params, headers=JSON_HEADERS, timeout=20)
+    except requests.RequestException:
+        log.warning("archive request to %s failed, checking domain redirect", url)
+        check = check_domain_redirect()
+        if check.get("redirected"):
+            url = f"https://{SC_DOMAIN}/it/archive"
+            log.info("retrying archive GET %s with new domain", url)
+            res = requests.get(url, params=params, headers=JSON_HEADERS, timeout=20)
+        else:
+            raise
+
+    final_host = urlparse(res.url).netloc.split(":")[0].strip().lower()
+    if (
+        final_host
+        and final_host != SC_DOMAIN.lower()
+        and _is_valid_sc_redirect(final_host, res.text[:2000] if hasattr(res, "text") else "")
+    ):
+        log.info(
+            "archive followed redirect: %s -> %s; updating catalogue domain", SC_DOMAIN, final_host
+        )
+        set_setting("sc_domain", final_host)
+        configure_domains(final_host, VIXSRC_DOMAIN)
+
     res.raise_for_status()
     return int(res.json().get("total") or 0)
 
@@ -380,7 +670,33 @@ def resolve_playlist(
 
     api_path = f"/api/{kind}/{tmdb_id}{suffix}"
     log.debug("resolve GET %s%s", base, api_path)
-    res = vixsrc_session.get(base + api_path, headers={"referer": referer}, timeout=20)
+    try:
+        res = vixsrc_session.get(base + api_path, headers={"referer": referer}, timeout=20)
+    except requests.RequestException:
+        log.warning("resolve request to %s failed, checking vixsrc redirect", base + api_path)
+        check = check_vixsrc_redirect()
+        if check.get("redirected"):
+            base = f"https://{VIXSRC_DOMAIN}"
+            referer = f"{base}/{kind}/{tmdb_id}{suffix}"
+            log.info("retrying resolve with new vixsrc domain %s", VIXSRC_DOMAIN)
+            res = vixsrc_session.get(base + api_path, headers={"referer": referer}, timeout=20)
+        else:
+            raise
+
+    final_host = urlparse(res.url).netloc.split(":")[0].strip().lower()
+    if (
+        final_host
+        and final_host != VIXSRC_DOMAIN.lower()
+        and _is_valid_vixsrc_redirect(final_host, res.text[:2000] if hasattr(res, "text") else "")
+    ):
+        log.info(
+            "resolve_playlist followed redirect: %s -> %s; updating playback domain",
+            VIXSRC_DOMAIN,
+            final_host,
+        )
+        set_setting("vixsrc_domain", final_host)
+        configure_domains(SC_DOMAIN, final_host)
+        base = f"https://{VIXSRC_DOMAIN}"
 
     if res.status_code == 404:  # absent from the host's catalogue; cacheable
         log.warning("playback host has no %s", api_path)
@@ -394,7 +710,33 @@ def resolve_playlist(
         raise RuntimeError("playback host returned no embed source")
 
     embed_url = src if src.startswith("http") else base + src
-    page = vixsrc_session.get(embed_url, headers={"referer": referer}, timeout=20).text
+    try:
+        page_res = vixsrc_session.get(embed_url, headers={"referer": referer}, timeout=20)
+        page = page_res.text
+        embed_final_host = urlparse(page_res.url).netloc.split(":")[0].strip().lower()
+        if (
+            embed_final_host
+            and embed_final_host != VIXSRC_DOMAIN.lower()
+            and _is_valid_vixsrc_redirect(embed_final_host, page[:2000])
+        ):
+            log.info(
+                "embed followed redirect: %s -> %s; updating playback domain",
+                VIXSRC_DOMAIN,
+                embed_final_host,
+            )
+            set_setting("vixsrc_domain", embed_final_host)
+            configure_domains(SC_DOMAIN, embed_final_host)
+    except requests.RequestException:
+        log.warning("embed fetch failed, checking vixsrc redirect")
+        check = check_vixsrc_redirect()
+        if check.get("redirected"):
+            base = f"https://{VIXSRC_DOMAIN}"
+            referer = f"{base}/{kind}/{tmdb_id}{suffix}"
+            embed_url = src if src.startswith("http") else base + src
+            page_res = vixsrc_session.get(embed_url, headers={"referer": referer}, timeout=20)
+            page = page_res.text
+        else:
+            raise
 
     raw_params = _scrape(
         r"window\.masterPlaylist[^:]+params:[^{]+({[^<]+?})", page, "playlist params"
@@ -465,6 +807,11 @@ def update_domain_settings(
     return {"scDomain": body.scDomain, "vixsrcDomain": body.vixsrcDomain}
 
 
+@app.post("/settings/domains/check-redirect")
+def check_domain_redirect_endpoint(_: Dict[str, Any] = Depends(require_admin)):
+    return check_all_domains_redirect()
+
+
 @app.get("/player")
 def player():
     """Playback embed host, so the dashboard can build iframe URLs client-side."""
@@ -509,9 +856,19 @@ def search(q: str = Query(..., max_length=120)):
     log.debug("search q=%r domain=%s", q, SC_DOMAIN)
     try:
         results = api.search(q)
-    except Exception as exc:  # upstream failure -> empty result, not a 500 page
-        log.exception("search q=%r failed", q)
-        raise HTTPException(status_code=502, detail=f"upstream search failed: {exc}")
+    except Exception as exc:
+        log.warning("search q=%r failed, checking domain redirect: %s", q, exc)
+        check = check_domain_redirect()
+        if check.get("redirected"):
+            log.info("retrying search q=%r with new domain %s", q, SC_DOMAIN)
+            try:
+                results = api.search(q)
+            except Exception as retry_exc:
+                log.exception("search retry failed")
+                raise HTTPException(status_code=502, detail=f"upstream search failed: {retry_exc}")
+        else:
+            log.exception("search q=%r failed", q)
+            raise HTTPException(status_code=502, detail=f"upstream search failed: {exc}")
     log.debug("search q=%r -> %d raw results", q, len(results))
     return [summary_from_browse(item) for item in results.values()]
 
@@ -537,7 +894,16 @@ def latest():
 @app.get("/title/{content_id}")
 def title(content_id: str):
     def load():
-        raw = api.load(content_id)
+        try:
+            raw = api.load(content_id)
+        except Exception as exc:
+            log.warning("title load %r failed, checking domain redirect: %s", content_id, exc)
+            check = check_domain_redirect()
+            if check.get("redirected"):
+                log.info("retrying title load %r with new domain %s", content_id, SC_DOMAIN)
+                raw = api.load(content_id)
+            else:
+                raise
         log.debug("title %r loaded keys=%s", content_id, sorted(raw.keys()))
         return detail_from_load(content_id, raw)
 
