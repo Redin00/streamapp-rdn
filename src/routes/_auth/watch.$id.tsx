@@ -531,6 +531,10 @@ function WatchPage() {
               className="size-full"
               allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
               referrerPolicy="no-referrer"
+              // sandbox WITHOUT allow-top-navigation blocks clickunder navigation at browser level.
+              // The blocker script hides the sandbox attribute from JS (frameElement proxy)
+              // so Vixsrc anti-sandbox checks don't show "Please Disable Sandbox".
+              sandbox="allow-scripts allow-same-origin allow-presentation allow-pointer-lock allow-downloads"
             />
           </div>
         </div>

@@ -137,7 +137,7 @@ VIXSRC_DOMAIN = get_setting(
 ).strip()
 IMAGE_CDN = f"https://cdn.{SC_DOMAIN}/images"
 api = API(SC_DOMAIN)
-if hasattr(vixsrc_session, "headers") and not getattr(vixsrc_session, "_impersonate", None):
+if hasattr(vixsrc_session, "headers") and not getattr(vixsrc_session, "impersonate", None) and not getattr(vixsrc_session, "_impersonate", None):
     vixsrc_session.headers["user-agent"] = api.user_agent
 JSON_HEADERS = {"user-agent": api.user_agent, "accept": "application/json"}
 bootstrap_admin()
@@ -155,7 +155,7 @@ def configure_domains(sc_domain: str, vixsrc_domain: str) -> None:
     VIXSRC_DOMAIN = vixsrc_domain
     IMAGE_CDN = f"https://cdn.{SC_DOMAIN}/images"
     api = API(SC_DOMAIN)
-    if hasattr(vixsrc_session, "headers") and not getattr(vixsrc_session, "_impersonate", None):
+    if hasattr(vixsrc_session, "headers") and not getattr(vixsrc_session, "impersonate", None) and not getattr(vixsrc_session, "_impersonate", None):
         vixsrc_session.headers["user-agent"] = api.user_agent
     JSON_HEADERS = {"user-agent": api.user_agent, "accept": "application/json"}
     _cache.clear()
@@ -702,7 +702,7 @@ def _fetch_embed_page(
     log.debug("resolve GET %s%s", base, api_path)
     try:
         res = vixsrc_session.get(base + api_path, headers={"referer": referer}, timeout=20)
-    except requests.RequestException:
+    except Exception:
         log.warning("resolve request to %s failed, checking vixsrc redirect", base + api_path)
         check = check_vixsrc_redirect()
         if check.get("redirected"):
@@ -760,7 +760,7 @@ def _fetch_embed_page(
             )
             set_setting("vixsrc_domain", embed_final_host)
             configure_domains(SC_DOMAIN, embed_final_host)
-    except requests.RequestException:
+    except Exception:
         log.warning("embed fetch failed, checking vixsrc redirect")
         check = check_vixsrc_redirect()
         if check.get("redirected"):
@@ -793,227 +793,120 @@ def clean_embed_html(html: str, domain: str) -> str:
         html = base_tag + html
 
 
-    # 2. Strip ad scripts, anti-sandbox, and anti-debugger
-    def should_remove(script_block: str) -> bool:
+    # 2. Strict whitelist filtering of all script tags
+    def is_allowed_script(script_block: str) -> bool:
         lower = script_block.lower()
-        # Ad networks (HilltopAds / PropellerAds / spbgc.com / etc.)
-        if "spbgc.com" in lower or "dataset.zone" in lower or "hilltopads" in lower or "propellerads" in lower:
-            return True
-        # Anti-sandbox checks
-        if "sandboxed iframe detected" in lower or "please disable sandbox" in lower:
-            return True
-        # Anti-debugger / devtools loops
-        if "minimaluserresponseinmiliseconds" in lower or "debugger;" in lower or "isdevtoolsopened" in lower:
-            return True
-        return False
+
+        # Explicit blacklist: reject any script with known ad networks, anti-sandbox, or anti-debugger
+        if any(bad in lower for bad in [
+            "spbgc.com", "dataset.zone", "hilltopads", "propellerads",
+            "popcash", "clickadu", "adcash", "monetag", "trafficjunky",
+            "sandboxed iframe detected", "please disable sandbox",
+            "minimaluserresponseinmiliseconds", "debugger;", "isdevtoolsopened",
+            "chrome pdf viewer", "application/pdf"
+        ]):
+            return False
+
+        # If it loads an external script via src, only allow legitimate Vixsrc / JWPlayer assets
+        if "src=" in lower:
+            return any(good in lower for good in [
+                "jwplayer", "embed-", "vixsrc-", "analytics.vixcloud.co"
+            ])
+
+        # If it is an inline script, only allow video setup and streams config
+        return any(good in lower for good in [
+            "window.video", "window.streams", "window.masterplaylist", "window.downloadurl"
+        ])
 
     html = re.sub(
         r"<script[\s\S]*?</script>",
-        lambda m: "" if should_remove(m.group(0)) else m.group(0),
+        lambda m: m.group(0) if is_allowed_script(m.group(0)) else "",
         html,
         flags=re.IGNORECASE,
     )
 
-    # 3. Inject defensive blocker AFTER stripping ad scripts (so it is not self-removed).
-    #    Blocks: window.open, popunders, location-hijack, dynamic ad script injection,
-    #    and capture-phase click interception.
-    _AD_DOMAINS = [
-        "spbgc.com", "dataset.zone", "hilltopads", "propellerads",
-        "adnxs.com", "doubleclick.net", "googlesyndication.com",
-        "adservice.google", "moatads.com", "adsystem.com",
-        "trafficjunky", "juicyads", "exoclick", "ero-advertising",
-        "popads.net", "popcash.net", "clickadu", "adcash",
-    ]
-    _ad_domains_js = "[" + ", ".join(f'"{d}"' for d in _AD_DOMAINS) + "]"
-
-    blocker_script = f"""<script>
-(function() {{
+    # 3. Defensive client-side blocker script (runs before any player JS)
+    blocker_script = """<script>
+(function() {
     'use strict';
 
-    var _adDomains = {_ad_domains_js};
-    var _ownHostname = window.location.hostname;
+    // ── 1. Kill window.open & Window.prototype.open ─────────────────────────
+    try {
+        window.open = function() {
+            console.log('[AdBlock] Blocked window.open');
+            return null;
+        };
+        if (window.Window && window.Window.prototype) {
+            window.Window.prototype.open = function() {
+                console.log('[AdBlock] Blocked Window.prototype.open');
+                return null;
+            };
+        }
+    } catch(e) {}
 
-    function isAdUrl(url) {{
-        try {{
-            var u = new URL(String(url));
-            var h = u.hostname;
-            if (h === _ownHostname) return false;
-            return _adDomains.some(function(d) {{ return h.indexOf(d) !== -1; }});
-        }} catch(e) {{ return false; }}
-    }}
+    // ── 2. Intercept programmatic anchor click (JWPlayer openLink & ad clickers)
+    try {
+        var _origAnchorClick = HTMLAnchorElement.prototype.click;
+        HTMLAnchorElement.prototype.click = function() {
+            var href = this.getAttribute('href') || this.href || '';
+            console.log('[AdBlock] Blocked programmatic anchor click to', href);
+            return;
+        };
+    } catch(e) {}
 
-    function isExternalUrl(url) {{
-        try {{
-            return new URL(String(url)).hostname !== _ownHostname;
-        }} catch(e) {{ return false; }}
-    }}
+    // ── 3. Intercept dispatchEvent on anchors ───────────────────────────────
+    try {
+        var _origDispatch = EventTarget.prototype.dispatchEvent;
+        EventTarget.prototype.dispatchEvent = function(evt) {
+            if (evt && evt.type === 'click' && (this instanceof HTMLAnchorElement)) {
+                console.log('[AdBlock] Blocked dispatchEvent click on anchor to', this.href);
+                return false;
+            }
+            return _origDispatch.apply(this, arguments);
+        };
+    } catch(e) {}
 
-    // ── 1. Kill window.open ────────────────────────────────────────────────────
-    window.open = function(url) {{
-        console.log('[AdBlock] Blocked window.open:', url);
-        return null;
-    }};
-
-    // ── 2. Block this window's location navigation ────────────────────────────
-    try {{
-        window.location.assign = function(url) {{
-            if (isExternalUrl(url)) {{ console.log('[AdBlock] Blocked location.assign:', url); return; }}
-            history.pushState(null, '', url);
-        }};
-        window.location.replace = function(url) {{
-            if (isExternalUrl(url)) {{ console.log('[AdBlock] Blocked location.replace:', url); return; }}
-            history.replaceState(null, '', url);
-        }};
-    }} catch(e) {{}}
-
-    try {{
-        var _locationProto = Object.getPrototypeOf(window.location);
-        var _origHrefDesc = Object.getOwnPropertyDescriptor(_locationProto, 'href')
-                            || Object.getOwnPropertyDescriptor(window.location, 'href');
-        if (_origHrefDesc && _origHrefDesc.set) {{
-            var _origHrefSet = _origHrefDesc.set;
-            Object.defineProperty(window.location, 'href', {{
-                set: function(url) {{
-                    if (isExternalUrl(url)) {{
-                        console.log('[AdBlock] Blocked location.href:', url);
+    // ── 4. Intercept user clicks on external links ──────────────────────────
+    document.addEventListener('click', function(e) {
+        var target = e.target;
+        while (target && target !== document) {
+            if (target.tagName === 'A' || target.tagName === 'AREA') {
+                var href = target.getAttribute('href') || target.href || '';
+                if (href && (href.startsWith('http://') || href.startsWith('https://') || href.startsWith('//'))) {
+                    try {
+                        var u = new URL(href, window.location.href);
+                        if (u.origin !== window.location.origin) {
+                            e.preventDefault();
+                            e.stopImmediatePropagation();
+                            console.log('[AdBlock] Blocked external link navigation to', href);
+                            return;
+                        }
+                    } catch(err) {
+                        e.preventDefault();
+                        e.stopImmediatePropagation();
                         return;
-                    }}
-                    _origHrefSet.call(window.location, url);
-                }},
-                get: _origHrefDesc.get,
-                configurable: true
-            }});
-        }}
-    }} catch(e) {{}}
+                    }
+                }
+            }
+            target = target.parentElement;
+        }
+    }, true);
 
-    // ── 3. Block top.location and parent.location (same-origin iframe escape) ──
-    //    The clean embed is served from our domain, so top/parent ARE accessible.
-    //    Ads use top.location.href = adUrl to navigate the outer page.
-    function makeLocProxy(realLoc) {{
-        return new Proxy(realLoc, {{
-            set: function(target, prop, value) {{
-                if (prop === 'href' || prop === 'pathname' || prop === 'search') {{
-                    console.log('[AdBlock] Blocked top/parent location.' + prop + ':', value);
-                    return true; // swallow silently
-                }}
-                target[prop] = value;
-                return true;
-            }},
-            get: function(target, prop) {{
-                if (prop === 'assign' || prop === 'replace') {{
-                    return function(url) {{
-                        console.log('[AdBlock] Blocked top/parent location.' + prop + ':', url);
-                    }};
-                }}
-                var val = target[prop];
-                return typeof val === 'function' ? val.bind(target) : val;
-            }}
-        }});
-    }}
+    // ── 5. Prevent dynamic iframe creation by ad scripts ─────────────────────
+    try {
+        var _origCreateElement = Document.prototype.createElement;
+        Document.prototype.createElement = function(tag) {
+            var el = _origCreateElement.apply(this, arguments);
+            if (String(tag).toLowerCase() === 'iframe') {
+                setTimeout(function() {
+                    if (el.parentNode) el.parentNode.removeChild(el);
+                }, 0);
+            }
+            return el;
+        };
+    } catch(e) {}
 
-    function makeWindowProxy(realWin) {{
-        var _locProxy = makeLocProxy(realWin.location);
-        return new Proxy(realWin, {{
-            set: function(target, prop, value) {{
-                if (prop === 'location') {{
-                    console.log('[AdBlock] Blocked top/parent.location =', value);
-                    return true;
-                }}
-                target[prop] = value;
-                return true;
-            }},
-            get: function(target, prop) {{
-                if (prop === 'location') return _locProxy;
-                if (prop === 'open') return window.open; // already neutered
-                var val = target[prop];
-                return typeof val === 'function' ? val.bind(target) : val;
-            }}
-        }});
-    }}
-
-    try {{
-        var _topProxy = makeWindowProxy(window.top);
-        Object.defineProperty(window, 'top', {{
-            get: function() {{ return _topProxy; }},
-            configurable: true
-        }});
-    }} catch(e) {{}}
-
-    try {{
-        var _parentProxy = makeWindowProxy(window.parent);
-        Object.defineProperty(window, 'parent', {{
-            get: function() {{ return _parentProxy; }},
-            configurable: true
-        }});
-    }} catch(e) {{}}
-
-    // ── 4. Intercept createElement for dynamic ad script injection ────────────
-    var _origCreate = document.createElement.bind(document);
-    document.createElement = function(tag) {{
-        var el = _origCreate(tag);
-        if (String(tag).toLowerCase() === 'script') {{
-            var _origSetAttr = el.setAttribute.bind(el);
-            el.setAttribute = function(name, value) {{
-                if (name === 'src' && _adDomains.some(function(d) {{ return String(value).indexOf(d) !== -1; }})) {{
-                    console.log('[AdBlock] Blocked dynamic script:', value);
-                    return;
-                }}
-                _origSetAttr(name, value);
-            }};
-        }}
-        return el;
-    }};
-
-    // ── 5. MutationObserver — remove ad nodes injected after page load ─────────
-    new MutationObserver(function(mutations) {{
-        mutations.forEach(function(m) {{
-            m.addedNodes.forEach(function(node) {{
-                if (!node || node.nodeType !== 1) return;
-                var tag = (node.tagName || '').toLowerCase();
-                var url = (node.src || node.getAttribute && node.getAttribute('src') || '');
-                if ((tag === 'script' || tag === 'iframe') &&
-                    _adDomains.some(function(d) {{ return url.indexOf(d) !== -1; }})) {{
-                    node.parentNode && node.parentNode.removeChild(node);
-                    console.log('[AdBlock] Removed injected node:', url);
-                }}
-            }});
-        }});
-    }}).observe(document.documentElement, {{ childList: true, subtree: true }});
-
-    // ── 6. Capture-phase click — intercept <a> tag navigations ───────────────
-    document.addEventListener('click', function(e) {{
-        var el = e.target;
-        while (el && el !== document) {{
-            if (el.tagName === 'A' || el.tagName === 'AREA') {{
-                var href = el.getAttribute('href') || '';
-                if (isExternalUrl(href)) {{
-                    e.preventDefault();
-                    e.stopImmediatePropagation();
-                    console.log('[AdBlock] Blocked external <a>:', href);
-                }}
-                break;
-            }}
-            el = el.parentElement;
-        }}
-    }}, true);
-
-    // ── 7. setTimeout popunder blocker ────────────────────────────────────────
-    var _origSetTimeout = window.setTimeout;
-    var _clickTs = 0;
-    document.addEventListener('mousedown', function() {{ _clickTs = Date.now(); }}, true);
-    window.setTimeout = function(fn, delay) {{
-        var sinceClick = Date.now() - _clickTs;
-        if (sinceClick < 600 && delay < 1000 && typeof fn === 'function') {{
-            var _safe = function() {{
-                // run with open/location already blocked — safe
-                try {{ fn.apply(this, arguments); }} catch(ex) {{}}
-            }};
-            return _origSetTimeout.apply(window, [_safe, delay]);
-        }}
-        return _origSetTimeout.apply(window, arguments);
-    }};
-
-}})();
+})();
 </script>
 """
 
@@ -1024,7 +917,6 @@ def clean_embed_html(html: str, domain: str) -> str:
         count=1,
         flags=re.IGNORECASE,
     )
-    # Fallback: if no <base> tag exists (e.g. it was stripped), append before </head>
     if blocker_script not in html:
         html = re.sub(
             r'(</head>)',
@@ -1199,22 +1091,35 @@ def clean_embed_endpoint(
     except HTTPException:
         raise
     except Exception as exc:
-        log.warning("clean-embed failed (%s), redirecting to direct embed: %s", exc, fallback_url)
-        return RedirectResponse(fallback_url, status_code=307)
+        log.warning("clean-embed failed (%s), checking redirect and retrying", exc)
+        try:
+            check = check_vixsrc_redirect()
+            if check.get("redirected"):
+                html = resolve_clean_embed(tmdb, type, s, e, startAt)
+            else:
+                html = None
+        except Exception as retry_exc:
+            log.error("clean-embed retry failed: %s", retry_exc)
+            html = None
+
+        if html is None:
+            raise HTTPException(status_code=502, detail=f"could not fetch embed: {exc}")
 
     if html is None:
         raise HTTPException(status_code=404, detail="title not available on the playback host")
 
-    # Build allowed script sources for CSP (our proxy domain + vixsrc assets)
     vixsrc_assets = f"https://{VIXSRC_DOMAIN}"
     csp = (
-        f"default-src 'self' {vixsrc_assets} https://sc-u11-01.vix-content.net https://vixcloud.co https://analytics.vixcloud.co https://fonts.googleapis.com https://fonts.gstatic.com; "
-        f"script-src 'unsafe-inline' 'unsafe-eval' {vixsrc_assets} https://analytics.vixcloud.co; "
+        f"default-src 'self' {vixsrc_assets} https://*.vix-content.net https://*.vixcloud.co https://fonts.googleapis.com https://fonts.gstatic.com; "
+        f"script-src 'unsafe-inline' 'unsafe-eval' {vixsrc_assets} https://*.vixcloud.co; "
+        f"style-src 'unsafe-inline' {vixsrc_assets} https://fonts.googleapis.com; "
+        f"font-src {vixsrc_assets} https://fonts.gstatic.com data:; "
         f"media-src * blob:; "
         f"img-src * data: blob:; "
         f"connect-src * blob:; "
         f"frame-src 'none'; "
-        f"navigate-to 'none';"
+        f"form-action 'none'; "
+        f"object-src 'none';"
     )
 
     return Response(

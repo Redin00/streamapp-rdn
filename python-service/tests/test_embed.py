@@ -72,10 +72,9 @@ class TestCleanEmbed(unittest.TestCase):
 
         # 6. Blocker script must be injected with all key guards
         self.assertIn("[AdBlock]", cleaned)
-        self.assertIn("window.open =", cleaned)
-        self.assertIn("MutationObserver", cleaned)
-        self.assertIn("makeLocProxy", cleaned)   # top/parent location blocker
-        self.assertIn("_clickTs", cleaned)       # mousedown-based click guard
+        self.assertIn("window.open", cleaned)
+        self.assertIn("_origAnchorClick", cleaned)
+        self.assertIn("Blocked external link navigation", cleaned)
 
     @patch("main._fetch_embed_page")
     def test_clean_embed_endpoint_success(self, mock_fetch):
@@ -97,14 +96,15 @@ class TestCleanEmbed(unittest.TestCase):
         res = self.client.get("/clean-embed?tmdb=9999999&type=movie")
         self.assertEqual(res.status_code, 404)
 
+    @patch("main.check_vixsrc_redirect")
     @patch("main._fetch_embed_page")
-    def test_clean_embed_endpoint_falls_back_on_error(self, mock_fetch):
+    def test_clean_embed_endpoint_errors_safely_on_failure(self, mock_fetch, mock_check):
         mock_fetch.side_effect = RuntimeError("playback host returned 403")
+        mock_check.return_value = {"redirected": False}
 
         res = self.client.get("/clean-embed?tmdb=550&type=movie&startAt=120", follow_redirects=False)
-        self.assertEqual(res.status_code, 307)
-        self.assertIn("location", res.headers)
-        self.assertEqual(res.headers["location"], "https://vixsrc.to/movie/550?startAt=120")
+        self.assertEqual(res.status_code, 502)
+        self.assertIn("could not fetch embed", res.json()["detail"])
 
     def test_player_endpoint_includes_clean_embed(self):
         res = self.client.get("/player")
