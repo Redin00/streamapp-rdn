@@ -139,7 +139,7 @@ function createService(python) {
   log("python", COLOR_PY, `starting uvicorn on port ${SC_PORT}...`);
   return spawn(
     python,
-    ["-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", String(SC_PORT)],
+    ["-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", String(SC_PORT), "--reload"],
     {
       cwd: PY_DIR,
       env: { ...process.env },
