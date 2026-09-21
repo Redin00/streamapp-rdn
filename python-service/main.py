@@ -830,89 +830,41 @@ def clean_embed_html(html: str, domain: str) -> str:
 (function() {{
     'use strict';
 
-    // ── 1. Kill window.open (popups / popunders) ──────────────────────────────
+    var _adDomains = {_ad_domains_js};
+    var _ownHostname = window.location.hostname;
+
+    function isAdUrl(url) {{
+        try {{
+            var u = new URL(String(url));
+            var h = u.hostname;
+            if (h === _ownHostname) return false;
+            return _adDomains.some(function(d) {{ return h.indexOf(d) !== -1; }});
+        }} catch(e) {{ return false; }}
+    }}
+
+    function isExternalUrl(url) {{
+        try {{
+            return new URL(String(url)).hostname !== _ownHostname;
+        }} catch(e) {{ return false; }}
+    }}
+
+    // ── 1. Kill window.open ────────────────────────────────────────────────────
     window.open = function(url) {{
         console.log('[AdBlock] Blocked window.open:', url);
         return null;
     }};
 
-    // ── 2. Block location-hijack ──────────────────────────────────────────────
-    var _adDomains = {_ad_domains_js};
-    function isAdUrl(url) {{
-        try {{
-            var hostname = new URL(String(url)).hostname;
-            return _adDomains.some(function(d) {{ return hostname.indexOf(d) !== -1; }});
-        }} catch(e) {{ return false; }}
-    }}
+    // ── 2. Block this window's location navigation ────────────────────────────
     try {{
-        var _realAssign = window.location.assign.bind(window.location);
-        var _realReplace = window.location.replace.bind(window.location);
         window.location.assign = function(url) {{
-            if (isAdUrl(url)) {{ console.log('[AdBlock] Blocked location.assign:', url); return; }}
-            _realAssign(url);
+            if (isExternalUrl(url)) {{ console.log('[AdBlock] Blocked location.assign:', url); return; }}
+            history.pushState(null, '', url);
         }};
         window.location.replace = function(url) {{
-            if (isAdUrl(url)) {{ console.log('[AdBlock] Blocked location.replace:', url); return; }}
-            _realReplace(url);
+            if (isExternalUrl(url)) {{ console.log('[AdBlock] Blocked location.replace:', url); return; }}
+            history.replaceState(null, '', url);
         }};
     }} catch(e) {{}}
-
-    // ── 3. Intercept createElement to block dynamic ad script injection ───────
-    var _origCreate = document.createElement.bind(document);
-    document.createElement = function(tag) {{
-        var el = _origCreate(tag);
-        if (String(tag).toLowerCase() === 'script') {{
-            var _origSetAttribute = el.setAttribute.bind(el);
-            el.setAttribute = function(name, value) {{
-                if (name === 'src' && _adDomains.some(function(d) {{ return String(value).indexOf(d) !== -1; }})) {{
-                    console.log('[AdBlock] Blocked dynamic script injection:', value);
-                    return;
-                }}
-                _origSetAttribute(name, value);
-            }};
-        }}
-        return el;
-    }};
-
-    // ── 4. MutationObserver — remove ad nodes added to DOM after load ─────────
-    var _observer = new MutationObserver(function(mutations) {{
-        mutations.forEach(function(m) {{
-            m.addedNodes.forEach(function(node) {{
-                if (!node || node.nodeType !== 1) return;
-                var tag = (node.tagName || '').toLowerCase();
-                var src = node.src || node.getAttribute('src') || '';
-                var href = node.href || node.getAttribute('href') || '';
-                var url = src || href;
-                if ((tag === 'script' || tag === 'iframe' || tag === 'link') &&
-                    _adDomains.some(function(d) {{ return url.indexOf(d) !== -1; }})) {{
-                    console.log('[AdBlock] Removed injected ad node:', url);
-                    node.parentNode && node.parentNode.removeChild(node);
-                }}
-            }});
-        }});
-    }});
-    _observer.observe(document.documentElement, {{ childList: true, subtree: true }});
-
-    // ── 5. Click guard + location.href override (clickunder blocker) ──────────
-    var _origSetTimeout = window.setTimeout;
-    var _clickActive = false;
-    document.addEventListener('click', function(e) {{
-        _clickActive = true;
-        _origSetTimeout(function() {{ _clickActive = false; }}, 500);
-        var el = e.target;
-        while (el && el !== document) {{
-            if (el.tagName === 'A' || el.tagName === 'AREA') {{
-                var href = el.getAttribute('href') || '';
-                if (href.startsWith('http') && !href.includes(window.location.hostname)) {{
-                    e.preventDefault();
-                    e.stopImmediatePropagation();
-                    console.log('[AdBlock] Blocked external link:', href);
-                }}
-                break;
-            }}
-            el = el.parentElement;
-        }}
-    }}, true);
 
     try {{
         var _locationProto = Object.getPrototypeOf(window.location);
@@ -922,18 +874,9 @@ def clean_embed_html(html: str, domain: str) -> str:
             var _origHrefSet = _origHrefDesc.set;
             Object.defineProperty(window.location, 'href', {{
                 set: function(url) {{
-                    if (isAdUrl(url)) {{
-                        console.log('[AdBlock] Blocked location.href (ad):', url);
+                    if (isExternalUrl(url)) {{
+                        console.log('[AdBlock] Blocked location.href:', url);
                         return;
-                    }}
-                    if (_clickActive) {{
-                        try {{
-                            var host = new URL(String(url)).hostname;
-                            if (host && host !== window.location.hostname) {{
-                                console.log('[AdBlock] Blocked clickunder location.href:', url);
-                                return;
-                            }}
-                        }} catch(ex) {{}}
                     }}
                     _origHrefSet.call(window.location, url);
                 }},
@@ -943,12 +886,129 @@ def clean_embed_html(html: str, domain: str) -> str:
         }}
     }} catch(e) {{}}
 
+    // ── 3. Block top.location and parent.location (same-origin iframe escape) ──
+    //    The clean embed is served from our domain, so top/parent ARE accessible.
+    //    Ads use top.location.href = adUrl to navigate the outer page.
+    function makeLocProxy(realLoc) {{
+        return new Proxy(realLoc, {{
+            set: function(target, prop, value) {{
+                if (prop === 'href' || prop === 'pathname' || prop === 'search') {{
+                    console.log('[AdBlock] Blocked top/parent location.' + prop + ':', value);
+                    return true; // swallow silently
+                }}
+                target[prop] = value;
+                return true;
+            }},
+            get: function(target, prop) {{
+                if (prop === 'assign' || prop === 'replace') {{
+                    return function(url) {{
+                        console.log('[AdBlock] Blocked top/parent location.' + prop + ':', url);
+                    }};
+                }}
+                var val = target[prop];
+                return typeof val === 'function' ? val.bind(target) : val;
+            }}
+        }});
+    }}
+
+    function makeWindowProxy(realWin) {{
+        var _locProxy = makeLocProxy(realWin.location);
+        return new Proxy(realWin, {{
+            set: function(target, prop, value) {{
+                if (prop === 'location') {{
+                    console.log('[AdBlock] Blocked top/parent.location =', value);
+                    return true;
+                }}
+                target[prop] = value;
+                return true;
+            }},
+            get: function(target, prop) {{
+                if (prop === 'location') return _locProxy;
+                if (prop === 'open') return window.open; // already neutered
+                var val = target[prop];
+                return typeof val === 'function' ? val.bind(target) : val;
+            }}
+        }});
+    }}
+
+    try {{
+        var _topProxy = makeWindowProxy(window.top);
+        Object.defineProperty(window, 'top', {{
+            get: function() {{ return _topProxy; }},
+            configurable: true
+        }});
+    }} catch(e) {{}}
+
+    try {{
+        var _parentProxy = makeWindowProxy(window.parent);
+        Object.defineProperty(window, 'parent', {{
+            get: function() {{ return _parentProxy; }},
+            configurable: true
+        }});
+    }} catch(e) {{}}
+
+    // ── 4. Intercept createElement for dynamic ad script injection ────────────
+    var _origCreate = document.createElement.bind(document);
+    document.createElement = function(tag) {{
+        var el = _origCreate(tag);
+        if (String(tag).toLowerCase() === 'script') {{
+            var _origSetAttr = el.setAttribute.bind(el);
+            el.setAttribute = function(name, value) {{
+                if (name === 'src' && _adDomains.some(function(d) {{ return String(value).indexOf(d) !== -1; }})) {{
+                    console.log('[AdBlock] Blocked dynamic script:', value);
+                    return;
+                }}
+                _origSetAttr(name, value);
+            }};
+        }}
+        return el;
+    }};
+
+    // ── 5. MutationObserver — remove ad nodes injected after page load ─────────
+    new MutationObserver(function(mutations) {{
+        mutations.forEach(function(m) {{
+            m.addedNodes.forEach(function(node) {{
+                if (!node || node.nodeType !== 1) return;
+                var tag = (node.tagName || '').toLowerCase();
+                var url = (node.src || node.getAttribute && node.getAttribute('src') || '');
+                if ((tag === 'script' || tag === 'iframe') &&
+                    _adDomains.some(function(d) {{ return url.indexOf(d) !== -1; }})) {{
+                    node.parentNode && node.parentNode.removeChild(node);
+                    console.log('[AdBlock] Removed injected node:', url);
+                }}
+            }});
+        }});
+    }}).observe(document.documentElement, {{ childList: true, subtree: true }});
+
+    // ── 6. Capture-phase click — intercept <a> tag navigations ───────────────
+    document.addEventListener('click', function(e) {{
+        var el = e.target;
+        while (el && el !== document) {{
+            if (el.tagName === 'A' || el.tagName === 'AREA') {{
+                var href = el.getAttribute('href') || '';
+                if (isExternalUrl(href)) {{
+                    e.preventDefault();
+                    e.stopImmediatePropagation();
+                    console.log('[AdBlock] Blocked external <a>:', href);
+                }}
+                break;
+            }}
+            el = el.parentElement;
+        }}
+    }}, true);
+
+    // ── 7. setTimeout popunder blocker ────────────────────────────────────────
+    var _origSetTimeout = window.setTimeout;
+    var _clickTs = 0;
+    document.addEventListener('mousedown', function() {{ _clickTs = Date.now(); }}, true);
     window.setTimeout = function(fn, delay) {{
-        if (_clickActive && delay < 1000) {{
-            var _wrappedFn = typeof fn === 'function' ? function() {{
+        var sinceClick = Date.now() - _clickTs;
+        if (sinceClick < 600 && delay < 1000 && typeof fn === 'function') {{
+            var _safe = function() {{
+                // run with open/location already blocked — safe
                 try {{ fn.apply(this, arguments); }} catch(ex) {{}}
-            }} : fn;
-            return _origSetTimeout.apply(window, [_wrappedFn, delay]);
+            }};
+            return _origSetTimeout.apply(window, [_safe, delay]);
         }}
         return _origSetTimeout.apply(window, arguments);
     }};

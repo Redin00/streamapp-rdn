@@ -74,7 +74,8 @@ class TestCleanEmbed(unittest.TestCase):
         self.assertIn("[AdBlock]", cleaned)
         self.assertIn("window.open =", cleaned)
         self.assertIn("MutationObserver", cleaned)
-        self.assertIn("_clickActive", cleaned)
+        self.assertIn("makeLocProxy", cleaned)   # top/parent location blocker
+        self.assertIn("_clickTs", cleaned)       # mousedown-based click guard
 
     @patch("main._fetch_embed_page")
     def test_clean_embed_endpoint_success(self, mock_fetch):
