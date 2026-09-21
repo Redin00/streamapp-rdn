@@ -91,6 +91,15 @@ class TestCleanEmbed(unittest.TestCase):
         res = self.client.get("/clean-embed?tmdb=9999999&type=movie")
         self.assertEqual(res.status_code, 404)
 
+    @patch("main._fetch_embed_page")
+    def test_clean_embed_endpoint_falls_back_on_error(self, mock_fetch):
+        mock_fetch.side_effect = RuntimeError("playback host returned 403")
+
+        res = self.client.get("/clean-embed?tmdb=550&type=movie&startAt=120", follow_redirects=False)
+        self.assertEqual(res.status_code, 307)
+        self.assertIn("location", res.headers)
+        self.assertEqual(res.headers["location"], "https://vixsrc.to/movie/550?startAt=120")
+
     def test_player_endpoint_includes_clean_embed(self):
         res = self.client.get("/player")
         self.assertEqual(res.status_code, 200)

@@ -55,7 +55,13 @@ from urllib.parse import urlparse
 
 import requests
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
+from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
+
+try:
+    from curl_cffi import requests as curl_requests
+except ImportError:
+    curl_requests = None
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from scuapi import API
@@ -92,8 +98,25 @@ VIXSRC_DOMAIN = ""
 
 api = None
 
+def create_vixsrc_session():
+    if curl_requests is not None:
+        try:
+            session = curl_requests.Session(impersonate="chrome120")
+            log.info("vixsrc_session initialized with curl_cffi Chrome impersonation")
+            return session
+        except Exception as exc:
+            log.warning("curl_cffi session init failed (%s), using requests.Session", exc)
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+    })
+    return session
+
+
 # The playback host is scraped over two back-to-back requests, so pool them.
-vixsrc_session = requests.Session()
+vixsrc_session = create_vixsrc_session()
 JSON_HEADERS = {}
 
 # Where uploaded profile pictures are stored (defaults to an `uploads` folder beside this file).
@@ -114,7 +137,8 @@ VIXSRC_DOMAIN = get_setting(
 ).strip()
 IMAGE_CDN = f"https://cdn.{SC_DOMAIN}/images"
 api = API(SC_DOMAIN)
-vixsrc_session.headers["user-agent"] = api.user_agent
+if hasattr(vixsrc_session, "headers") and not getattr(vixsrc_session, "_impersonate", None):
+    vixsrc_session.headers["user-agent"] = api.user_agent
 JSON_HEADERS = {"user-agent": api.user_agent, "accept": "application/json"}
 bootstrap_admin()
 
@@ -131,7 +155,8 @@ def configure_domains(sc_domain: str, vixsrc_domain: str) -> None:
     VIXSRC_DOMAIN = vixsrc_domain
     IMAGE_CDN = f"https://cdn.{SC_DOMAIN}/images"
     api = API(SC_DOMAIN)
-    vixsrc_session.headers["user-agent"] = api.user_agent
+    if hasattr(vixsrc_session, "headers") and not getattr(vixsrc_session, "_impersonate", None):
+        vixsrc_session.headers["user-agent"] = api.user_agent
     JSON_HEADERS = {"user-agent": api.user_agent, "accept": "application/json"}
     _cache.clear()
 
@@ -968,13 +993,19 @@ def clean_embed_endpoint(
     if type == "tv" and not (s and e):
         raise HTTPException(status_code=422, detail="series need both s and e")
 
+    base = f"https://{VIXSRC_DOMAIN}"
+    path = f"/tv/{tmdb}/{s}/{e}" if type == "tv" else f"/movie/{tmdb}"
+    fallback_url = f"{base}{path}"
+    if startAt is not None and startAt > 0:
+        fallback_url += f"?startAt={int(startAt)}"
+
     try:
         html = resolve_clean_embed(tmdb, type, s, e, startAt)
     except HTTPException:
         raise
     except Exception as exc:
-        log.exception("clean-embed %s %s failed", type, tmdb)
-        raise HTTPException(status_code=502, detail=f"could not fetch embed: {exc}")
+        log.warning("clean-embed failed (%s), redirecting to direct embed: %s", exc, fallback_url)
+        return RedirectResponse(fallback_url, status_code=307)
 
     if html is None:
         raise HTTPException(status_code=404, detail="title not available on the playback host")
