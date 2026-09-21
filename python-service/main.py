@@ -55,13 +55,7 @@ from urllib.parse import urlparse
 
 import requests
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
-from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
-
-try:
-    from curl_cffi import requests as curl_requests
-except ImportError:
-    curl_requests = None
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from scuapi import API
@@ -98,25 +92,8 @@ VIXSRC_DOMAIN = ""
 
 api = None
 
-def create_vixsrc_session():
-    if curl_requests is not None:
-        try:
-            session = curl_requests.Session(impersonate="chrome120")
-            log.info("vixsrc_session initialized with curl_cffi Chrome impersonation")
-            return session
-        except Exception as exc:
-            log.warning("curl_cffi session init failed (%s), using requests.Session", exc)
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
-    })
-    return session
-
-
 # The playback host is scraped over two back-to-back requests, so pool them.
-vixsrc_session = create_vixsrc_session()
+vixsrc_session = requests.Session()
 JSON_HEADERS = {}
 
 # Where uploaded profile pictures are stored (defaults to an `uploads` folder beside this file).
@@ -137,8 +114,7 @@ VIXSRC_DOMAIN = get_setting(
 ).strip()
 IMAGE_CDN = f"https://cdn.{SC_DOMAIN}/images"
 api = API(SC_DOMAIN)
-if hasattr(vixsrc_session, "headers") and not getattr(vixsrc_session, "impersonate", None) and not getattr(vixsrc_session, "_impersonate", None):
-    vixsrc_session.headers["user-agent"] = api.user_agent
+vixsrc_session.headers["user-agent"] = api.user_agent
 JSON_HEADERS = {"user-agent": api.user_agent, "accept": "application/json"}
 bootstrap_admin()
 
@@ -155,8 +131,7 @@ def configure_domains(sc_domain: str, vixsrc_domain: str) -> None:
     VIXSRC_DOMAIN = vixsrc_domain
     IMAGE_CDN = f"https://cdn.{SC_DOMAIN}/images"
     api = API(SC_DOMAIN)
-    if hasattr(vixsrc_session, "headers") and not getattr(vixsrc_session, "impersonate", None) and not getattr(vixsrc_session, "_impersonate", None):
-        vixsrc_session.headers["user-agent"] = api.user_agent
+    vixsrc_session.headers["user-agent"] = api.user_agent
     JSON_HEADERS = {"user-agent": api.user_agent, "accept": "application/json"}
     _cache.clear()
 
@@ -684,15 +659,10 @@ def _scrape(pattern: str, page: str, what: str) -> str:
     return match.group(1)
 
 
-def _fetch_embed_page(
-    tmdb_id: int,
-    media_type: str,
-    season: Optional[int] = None,
-    episode: Optional[int] = None,
-    start_at: Optional[int] = None,
-) -> Optional[tuple[str, str]]:
-    """Fetch the raw embed HTML page from Vixsrc. Returns (page_html, domain) or None if 404."""
-    global VIXSRC_DOMAIN
+def resolve_playlist(
+    tmdb_id: int, media_type: str, season: Optional[int] = None, episode: Optional[int] = None
+) -> Optional[Dict[str, Any]]:
+    """Resolve a playable HLS master playlist, or None if the host lacks the title."""
     base = f"https://{VIXSRC_DOMAIN}"
     kind = "tv" if media_type == "tv" else "movie"
     suffix = f"/{season}/{episode}" if season and episode else ""
@@ -702,7 +672,7 @@ def _fetch_embed_page(
     log.debug("resolve GET %s%s", base, api_path)
     try:
         res = vixsrc_session.get(base + api_path, headers={"referer": referer}, timeout=20)
-    except Exception:
+    except requests.RequestException:
         log.warning("resolve request to %s failed, checking vixsrc redirect", base + api_path)
         check = check_vixsrc_redirect()
         if check.get("redirected"):
@@ -720,7 +690,7 @@ def _fetch_embed_page(
         and _is_valid_vixsrc_redirect(final_host, res.text[:2000] if hasattr(res, "text") else "")
     ):
         log.info(
-            "resolve followed redirect: %s -> %s; updating playback domain",
+            "resolve_playlist followed redirect: %s -> %s; updating playback domain",
             VIXSRC_DOMAIN,
             final_host,
         )
@@ -740,10 +710,6 @@ def _fetch_embed_page(
         raise RuntimeError("playback host returned no embed source")
 
     embed_url = src if src.startswith("http") else base + src
-    if start_at is not None and start_at > 0:
-        sep = "&" if "?" in embed_url else "?"
-        embed_url = f"{embed_url}{sep}startAt={int(start_at)}"
-
     try:
         page_res = vixsrc_session.get(embed_url, headers={"referer": referer}, timeout=20)
         page = page_res.text
@@ -760,197 +726,17 @@ def _fetch_embed_page(
             )
             set_setting("vixsrc_domain", embed_final_host)
             configure_domains(SC_DOMAIN, embed_final_host)
-    except Exception:
+    except requests.RequestException:
         log.warning("embed fetch failed, checking vixsrc redirect")
         check = check_vixsrc_redirect()
         if check.get("redirected"):
             base = f"https://{VIXSRC_DOMAIN}"
             referer = f"{base}/{kind}/{tmdb_id}{suffix}"
             embed_url = src if src.startswith("http") else base + src
-            if start_at is not None and start_at > 0:
-                sep = "&" if "?" in embed_url else "?"
-                embed_url = f"{embed_url}{sep}startAt={int(start_at)}"
             page_res = vixsrc_session.get(embed_url, headers={"referer": referer}, timeout=20)
             page = page_res.text
         else:
             raise
-
-    return page, VIXSRC_DOMAIN
-
-
-def clean_embed_html(html: str, domain: str) -> str:
-    """Sanitize Vixsrc embed HTML by stripping intrusive ad scripts, anti-sandbox,
-
-    and anti-debugger loops while preserving JWPlayer and playback functionality.
-    """
-    # 1. Base tag so relative assets (/jwplayer-..., fonts, icons) resolve against Vixsrc
-    base_tag = f'<base href="https://{domain}/">\n'
-    if "<head>" in html:
-        html = html.replace("<head>", f"<head>\n    {base_tag}", 1)
-    elif "<HEAD>" in html:
-        html = html.replace("<HEAD>", f"<HEAD>\n    {base_tag}", 1)
-    else:
-        html = base_tag + html
-
-
-    # 2. Strict whitelist filtering of all script tags
-    def is_allowed_script(script_block: str) -> bool:
-        lower = script_block.lower()
-
-        # Explicit blacklist: reject any script with known ad networks, anti-sandbox, or anti-debugger
-        if any(bad in lower for bad in [
-            "spbgc.com", "dataset.zone", "hilltopads", "propellerads",
-            "popcash", "clickadu", "adcash", "monetag", "trafficjunky",
-            "sandboxed iframe detected", "please disable sandbox",
-            "minimaluserresponseinmiliseconds", "debugger;", "isdevtoolsopened",
-            "chrome pdf viewer", "application/pdf"
-        ]):
-            return False
-
-        # If it loads an external script via src, only allow legitimate Vixsrc / JWPlayer assets
-        if "src=" in lower:
-            return any(good in lower for good in [
-                "jwplayer", "embed-", "vixsrc-", "analytics.vixcloud.co"
-            ])
-
-        # If it is an inline script, only allow video setup and streams config
-        return any(good in lower for good in [
-            "window.video", "window.streams", "window.masterplaylist", "window.downloadurl"
-        ])
-
-    html = re.sub(
-        r"<script[\s\S]*?</script>",
-        lambda m: m.group(0) if is_allowed_script(m.group(0)) else "",
-        html,
-        flags=re.IGNORECASE,
-    )
-
-    # 3. Defensive client-side blocker script (runs before any player JS)
-    blocker_script = """<script>
-(function() {
-    'use strict';
-
-    // ── 1. Kill window.open & Window.prototype.open ─────────────────────────
-    try {
-        window.open = function() {
-            console.log('[AdBlock] Blocked window.open');
-            return null;
-        };
-        if (window.Window && window.Window.prototype) {
-            window.Window.prototype.open = function() {
-                console.log('[AdBlock] Blocked Window.prototype.open');
-                return null;
-            };
-        }
-    } catch(e) {}
-
-    // ── 2. Intercept programmatic anchor click (JWPlayer openLink & ad clickers)
-    try {
-        var _origAnchorClick = HTMLAnchorElement.prototype.click;
-        HTMLAnchorElement.prototype.click = function() {
-            var href = this.getAttribute('href') || this.href || '';
-            console.log('[AdBlock] Blocked programmatic anchor click to', href);
-            return;
-        };
-    } catch(e) {}
-
-    // ── 3. Intercept dispatchEvent on anchors ───────────────────────────────
-    try {
-        var _origDispatch = EventTarget.prototype.dispatchEvent;
-        EventTarget.prototype.dispatchEvent = function(evt) {
-            if (evt && evt.type === 'click' && (this instanceof HTMLAnchorElement)) {
-                console.log('[AdBlock] Blocked dispatchEvent click on anchor to', this.href);
-                return false;
-            }
-            return _origDispatch.apply(this, arguments);
-        };
-    } catch(e) {}
-
-    // ── 4. Intercept user clicks on external links ──────────────────────────
-    document.addEventListener('click', function(e) {
-        var target = e.target;
-        while (target && target !== document) {
-            if (target.tagName === 'A' || target.tagName === 'AREA') {
-                var href = target.getAttribute('href') || target.href || '';
-                if (href && (href.startsWith('http://') || href.startsWith('https://') || href.startsWith('//'))) {
-                    try {
-                        var u = new URL(href, window.location.href);
-                        if (u.origin !== window.location.origin) {
-                            e.preventDefault();
-                            e.stopImmediatePropagation();
-                            console.log('[AdBlock] Blocked external link navigation to', href);
-                            return;
-                        }
-                    } catch(err) {
-                        e.preventDefault();
-                        e.stopImmediatePropagation();
-                        return;
-                    }
-                }
-            }
-            target = target.parentElement;
-        }
-    }, true);
-
-    // ── 5. Prevent dynamic iframe creation by ad scripts ─────────────────────
-    try {
-        var _origCreateElement = Document.prototype.createElement;
-        Document.prototype.createElement = function(tag) {
-            var el = _origCreateElement.apply(this, arguments);
-            if (String(tag).toLowerCase() === 'iframe') {
-                setTimeout(function() {
-                    if (el.parentNode) el.parentNode.removeChild(el);
-                }, 0);
-            }
-            return el;
-        };
-    } catch(e) {}
-
-})();
-</script>
-"""
-
-    html = re.sub(
-        r'(<base\s[^>]*>)',
-        lambda m: m.group(0) + "\n" + blocker_script,
-        html,
-        count=1,
-        flags=re.IGNORECASE,
-    )
-    if blocker_script not in html:
-        html = re.sub(
-            r'(</head>)',
-            blocker_script + r'\1',
-            html,
-            count=1,
-            flags=re.IGNORECASE,
-        )
-    return html
-
-
-def resolve_clean_embed(
-    tmdb_id: int,
-    media_type: str,
-    season: Optional[int] = None,
-    episode: Optional[int] = None,
-    start_at: Optional[int] = None,
-) -> Optional[str]:
-    """Fetch and sanitize the Vixsrc embed HTML, removing ads and protections."""
-    result = _fetch_embed_page(tmdb_id, media_type, season, episode, start_at)
-    if result is None:
-        return None
-    page, domain = result
-    return clean_embed_html(page, domain)
-
-
-def resolve_playlist(
-    tmdb_id: int, media_type: str, season: Optional[int] = None, episode: Optional[int] = None
-) -> Optional[Dict[str, Any]]:
-    """Resolve a playable HLS master playlist, or None if the host lacks the title."""
-    result = _fetch_embed_page(tmdb_id, media_type, season, episode)
-    if result is None:
-        return None
-    page, _ = result
 
     raw_params = _scrape(
         r"window\.masterPlaylist[^:]+params:[^{]+({[^<]+?})", page, "playlist params"
@@ -977,7 +763,7 @@ def resolve_playlist(
         + f"expires={params['expires']}&token={params['token']}"
         + ("&h=1" if fhd else "")
     )
-    log.debug("resolved playlist for %s %s (fhd=%s)", media_type, tmdb_id, fhd)
+    log.debug("resolved playlist for %s %s (fhd=%s)", kind, tmdb_id, fhd)
     return {"playlistUrl": playlist, "expiresAt": int(params["expires"]), "fhd": fhd}
 
 
@@ -1034,7 +820,6 @@ def player():
         "provider": "vixsrc",
         "domain": vixsrc_domain,
         "enabled": bool(vixsrc_domain),
-        "cleanEmbed": True,
     }
 
 
@@ -1064,73 +849,6 @@ def stream(
     if resolved is None:
         raise HTTPException(status_code=404, detail="title not available on the playback host")
     return {"provider": "vixsrc", **resolved}
-
-
-@app.get("/clean-embed")
-def clean_embed_endpoint(
-    tmdb: int = Query(..., gt=0),
-    type: str = Query("movie", pattern="^(movie|tv)$"),
-    s: Optional[int] = Query(None, gt=0),
-    e: Optional[int] = Query(None, gt=0),
-    startAt: Optional[int] = Query(None, ge=0),
-):
-    """Cleaned Vixsrc playback embed without ads, popups, or anti-sandbox protections."""
-    if not VIXSRC_DOMAIN:
-        raise HTTPException(status_code=503, detail="no playback host configured")
-    if type == "tv" and not (s and e):
-        raise HTTPException(status_code=422, detail="series need both s and e")
-
-    base = f"https://{VIXSRC_DOMAIN}"
-    path = f"/tv/{tmdb}/{s}/{e}" if type == "tv" else f"/movie/{tmdb}"
-    fallback_url = f"{base}{path}"
-    if startAt is not None and startAt > 0:
-        fallback_url += f"?startAt={int(startAt)}"
-
-    try:
-        html = resolve_clean_embed(tmdb, type, s, e, startAt)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        log.warning("clean-embed failed (%s), checking redirect and retrying", exc)
-        try:
-            check = check_vixsrc_redirect()
-            if check.get("redirected"):
-                html = resolve_clean_embed(tmdb, type, s, e, startAt)
-            else:
-                html = None
-        except Exception as retry_exc:
-            log.error("clean-embed retry failed: %s", retry_exc)
-            html = None
-
-        if html is None:
-            raise HTTPException(status_code=502, detail=f"could not fetch embed: {exc}")
-
-    if html is None:
-        raise HTTPException(status_code=404, detail="title not available on the playback host")
-
-    vixsrc_assets = f"https://{VIXSRC_DOMAIN}"
-    csp = (
-        f"default-src 'self' {vixsrc_assets} https://*.vix-content.net https://*.vixcloud.co https://fonts.googleapis.com https://fonts.gstatic.com; "
-        f"script-src 'unsafe-inline' 'unsafe-eval' {vixsrc_assets} https://*.vixcloud.co; "
-        f"style-src 'unsafe-inline' {vixsrc_assets} https://fonts.googleapis.com; "
-        f"font-src {vixsrc_assets} https://fonts.gstatic.com data:; "
-        f"media-src * blob:; "
-        f"img-src * data: blob:; "
-        f"connect-src * blob:; "
-        f"frame-src 'none'; "
-        f"form-action 'none'; "
-        f"object-src 'none';"
-    )
-
-    return Response(
-        content=html,
-        media_type="text/html; charset=utf-8",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Content-Security-Policy": csp,
-            "X-Frame-Options": "SAMEORIGIN",
-        },
-    )
 
 
 @app.get("/search")

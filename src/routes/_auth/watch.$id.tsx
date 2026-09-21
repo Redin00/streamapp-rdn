@@ -521,9 +521,7 @@ function WatchPage() {
           {showFallbackNotice ? (
             <p className="text-xs text-muted-foreground">{t("watch_unavailable")}</p>
           ) : null}
-          {!player.cleanEmbed && adBlockPrompt.shouldShow ? (
-            <AdBlockPrompt browser={adBlockPrompt.info.browser} />
-          ) : null}
+          {adBlockPrompt.shouldShow ? <AdBlockPrompt browser={adBlockPrompt.info.browser} /> : null}
           <div className="aspect-video w-full overflow-hidden rounded-xl border border-border bg-black">
             <iframe
               src={resumeEmbedUrl ?? embedUrl}
@@ -531,10 +529,6 @@ function WatchPage() {
               className="size-full"
               allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
               referrerPolicy="no-referrer"
-              // sandbox WITHOUT allow-top-navigation blocks clickunder navigation at browser level.
-              // The blocker script hides the sandbox attribute from JS (frameElement proxy)
-              // so Vixsrc anti-sandbox checks don't show "Please Disable Sandbox".
-              sandbox="allow-scripts allow-same-origin allow-presentation allow-pointer-lock allow-downloads"
             />
           </div>
         </div>

@@ -21,14 +21,6 @@ export default defineConfig(({ command, mode }) => {
           },
         }
       : {}),
-    server: {
-      proxy: {
-        "/clean-embed": {
-          target: process.env["STREAMING_API_URL"] || "http://localhost:8000",
-          changeOrigin: true,
-        },
-      },
-    },
     css: { transformer: "lightningcss" as const },
     resolve: {
       alias: { "@": `${process.cwd()}/src` },

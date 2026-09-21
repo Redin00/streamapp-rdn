@@ -44,7 +44,6 @@ export interface PlayerConfig {
   provider: string;
   domain: string;
   enabled: boolean;
-  cleanEmbed?: boolean | undefined;
 }
 
 /**

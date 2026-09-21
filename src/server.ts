@@ -53,34 +53,6 @@ function isH3SwallowedErrorBody(body: string): boolean {
 
 export default {
   async fetch(request: Request, env: unknown, ctx: unknown) {
-    const url = new URL(request.url);
-    if (url.pathname === "/clean-embed") {
-      const base = process.env["STREAMING_API_URL"] || "http://localhost:8000";
-      const upstreamUrl = `${base.replace(/\/$/, "")}${url.pathname}${url.search}`;
-      try {
-        const reqHeaders = new Headers(request.headers);
-        reqHeaders.delete("host");
-
-        const res = await fetch(upstreamUrl, {
-          method: request.method,
-          headers: reqHeaders,
-          redirect: "manual",
-        });
-
-        const resHeaders = new Headers(res.headers);
-        // Node fetch automatically decompresses bodies, so remove content-encoding and content-length
-        resHeaders.delete("content-encoding");
-        resHeaders.delete("content-length");
-
-        return new Response(res.body, {
-          status: res.status,
-          headers: resHeaders,
-        });
-      } catch (err) {
-        return new Response(`Failed to reach streaming service: ${err}`, { status: 502 });
-      }
-    }
-
     try {
       const handler = await getServerEntry();
       const response = await handler.fetch(request, env, ctx);
