@@ -792,33 +792,8 @@ def clean_embed_html(html: str, domain: str) -> str:
     else:
         html = base_tag + html
 
-    # 2. Defensive blocker script (neutralizes window.open and intercepts unauthorized link navigations)
-    blocker_script = """<script>
-(function() {
-    window.open = function() {
-        console.log('[AdBlock] Blocked window.open popup attempt');
-        return null;
-    };
-    window.addEventListener('click', function(e) {
-        var target = e.target;
-        while (target && target.tagName !== 'A') {
-            target = target.parentElement;
-        }
-        if (target && target.tagName === 'A') {
-            var href = target.getAttribute('href') || '';
-            if (href.startsWith('http') && !href.includes(window.location.hostname)) {
-                e.preventDefault();
-                e.stopPropagation();
-                console.log('[AdBlock] Blocked external link navigation to', href);
-            }
-        }
-    }, true);
-})();
-</script>
-"""
-    html = html.replace(base_tag, base_tag + blocker_script, 1)
 
-    # 3. Strip ad scripts, anti-sandbox, and anti-debugger
+    # 2. Strip ad scripts, anti-sandbox, and anti-debugger
     def should_remove(script_block: str) -> bool:
         lower = script_block.lower()
         # Ad networks (HilltopAds / PropellerAds / spbgc.com / etc.)
@@ -838,6 +813,166 @@ def clean_embed_html(html: str, domain: str) -> str:
         html,
         flags=re.IGNORECASE,
     )
+
+    # 3. Inject defensive blocker AFTER stripping ad scripts (so it is not self-removed).
+    #    Blocks: window.open, popunders, location-hijack, dynamic ad script injection,
+    #    and capture-phase click interception.
+    _AD_DOMAINS = [
+        "spbgc.com", "dataset.zone", "hilltopads", "propellerads",
+        "adnxs.com", "doubleclick.net", "googlesyndication.com",
+        "adservice.google", "moatads.com", "adsystem.com",
+        "trafficjunky", "juicyads", "exoclick", "ero-advertising",
+        "popads.net", "popcash.net", "clickadu", "adcash",
+    ]
+    _ad_domains_js = "[" + ", ".join(f'"{d}"' for d in _AD_DOMAINS) + "]"
+
+    blocker_script = f"""<script>
+(function() {{
+    'use strict';
+
+    // ── 1. Kill window.open (popups / popunders) ──────────────────────────────
+    window.open = function(url) {{
+        console.log('[AdBlock] Blocked window.open:', url);
+        return null;
+    }};
+
+    // ── 2. Block location-hijack ──────────────────────────────────────────────
+    var _adDomains = {_ad_domains_js};
+    function isAdUrl(url) {{
+        try {{
+            var hostname = new URL(String(url)).hostname;
+            return _adDomains.some(function(d) {{ return hostname.indexOf(d) !== -1; }});
+        }} catch(e) {{ return false; }}
+    }}
+    try {{
+        var _realAssign = window.location.assign.bind(window.location);
+        var _realReplace = window.location.replace.bind(window.location);
+        window.location.assign = function(url) {{
+            if (isAdUrl(url)) {{ console.log('[AdBlock] Blocked location.assign:', url); return; }}
+            _realAssign(url);
+        }};
+        window.location.replace = function(url) {{
+            if (isAdUrl(url)) {{ console.log('[AdBlock] Blocked location.replace:', url); return; }}
+            _realReplace(url);
+        }};
+    }} catch(e) {{}}
+
+    // ── 3. Intercept createElement to block dynamic ad script injection ───────
+    var _origCreate = document.createElement.bind(document);
+    document.createElement = function(tag) {{
+        var el = _origCreate(tag);
+        if (String(tag).toLowerCase() === 'script') {{
+            var _origSetAttribute = el.setAttribute.bind(el);
+            el.setAttribute = function(name, value) {{
+                if (name === 'src' && _adDomains.some(function(d) {{ return String(value).indexOf(d) !== -1; }})) {{
+                    console.log('[AdBlock] Blocked dynamic script injection:', value);
+                    return;
+                }}
+                _origSetAttribute(name, value);
+            }};
+        }}
+        return el;
+    }};
+
+    // ── 4. MutationObserver — remove ad nodes added to DOM after load ─────────
+    var _observer = new MutationObserver(function(mutations) {{
+        mutations.forEach(function(m) {{
+            m.addedNodes.forEach(function(node) {{
+                if (!node || node.nodeType !== 1) return;
+                var tag = (node.tagName || '').toLowerCase();
+                var src = node.src || node.getAttribute('src') || '';
+                var href = node.href || node.getAttribute('href') || '';
+                var url = src || href;
+                if ((tag === 'script' || tag === 'iframe' || tag === 'link') &&
+                    _adDomains.some(function(d) {{ return url.indexOf(d) !== -1; }})) {{
+                    console.log('[AdBlock] Removed injected ad node:', url);
+                    node.parentNode && node.parentNode.removeChild(node);
+                }}
+            }});
+        }});
+    }});
+    _observer.observe(document.documentElement, {{ childList: true, subtree: true }});
+
+    // ── 5. Click guard + location.href override (clickunder blocker) ──────────
+    var _origSetTimeout = window.setTimeout;
+    var _clickActive = false;
+    document.addEventListener('click', function(e) {{
+        _clickActive = true;
+        _origSetTimeout(function() {{ _clickActive = false; }}, 500);
+        var el = e.target;
+        while (el && el !== document) {{
+            if (el.tagName === 'A' || el.tagName === 'AREA') {{
+                var href = el.getAttribute('href') || '';
+                if (href.startsWith('http') && !href.includes(window.location.hostname)) {{
+                    e.preventDefault();
+                    e.stopImmediatePropagation();
+                    console.log('[AdBlock] Blocked external link:', href);
+                }}
+                break;
+            }}
+            el = el.parentElement;
+        }}
+    }}, true);
+
+    try {{
+        var _locationProto = Object.getPrototypeOf(window.location);
+        var _origHrefDesc = Object.getOwnPropertyDescriptor(_locationProto, 'href')
+                            || Object.getOwnPropertyDescriptor(window.location, 'href');
+        if (_origHrefDesc && _origHrefDesc.set) {{
+            var _origHrefSet = _origHrefDesc.set;
+            Object.defineProperty(window.location, 'href', {{
+                set: function(url) {{
+                    if (isAdUrl(url)) {{
+                        console.log('[AdBlock] Blocked location.href (ad):', url);
+                        return;
+                    }}
+                    if (_clickActive) {{
+                        try {{
+                            var host = new URL(String(url)).hostname;
+                            if (host && host !== window.location.hostname) {{
+                                console.log('[AdBlock] Blocked clickunder location.href:', url);
+                                return;
+                            }}
+                        }} catch(ex) {{}}
+                    }}
+                    _origHrefSet.call(window.location, url);
+                }},
+                get: _origHrefDesc.get,
+                configurable: true
+            }});
+        }}
+    }} catch(e) {{}}
+
+    window.setTimeout = function(fn, delay) {{
+        if (_clickActive && delay < 1000) {{
+            var _wrappedFn = typeof fn === 'function' ? function() {{
+                try {{ fn.apply(this, arguments); }} catch(ex) {{}}
+            }} : fn;
+            return _origSetTimeout.apply(window, [_wrappedFn, delay]);
+        }}
+        return _origSetTimeout.apply(window, arguments);
+    }};
+
+}})();
+</script>
+"""
+
+    html = re.sub(
+        r'(<base\s[^>]*>)',
+        lambda m: m.group(0) + "\n" + blocker_script,
+        html,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    # Fallback: if no <base> tag exists (e.g. it was stripped), append before </head>
+    if blocker_script not in html:
+        html = re.sub(
+            r'(</head>)',
+            blocker_script + r'\1',
+            html,
+            count=1,
+            flags=re.IGNORECASE,
+        )
     return html
 
 
@@ -1010,10 +1145,26 @@ def clean_embed_endpoint(
     if html is None:
         raise HTTPException(status_code=404, detail="title not available on the playback host")
 
+    # Build allowed script sources for CSP (our proxy domain + vixsrc assets)
+    vixsrc_assets = f"https://{VIXSRC_DOMAIN}"
+    csp = (
+        f"default-src 'self' {vixsrc_assets} https://sc-u11-01.vix-content.net https://vixcloud.co https://analytics.vixcloud.co https://fonts.googleapis.com https://fonts.gstatic.com; "
+        f"script-src 'unsafe-inline' 'unsafe-eval' {vixsrc_assets} https://analytics.vixcloud.co; "
+        f"media-src * blob:; "
+        f"img-src * data: blob:; "
+        f"connect-src * blob:; "
+        f"frame-src 'none'; "
+        f"navigate-to 'none';"
+    )
+
     return Response(
         content=html,
         media_type="text/html; charset=utf-8",
-        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Content-Security-Policy": csp,
+            "X-Frame-Options": "SAMEORIGIN",
+        },
     )
 
 

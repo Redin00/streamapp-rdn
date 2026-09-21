@@ -46,10 +46,11 @@ class TestCleanEmbed(unittest.TestCase):
     def test_clean_embed_html_strips_ads_and_protections(self):
         cleaned = clean_embed_html(SAMPLE_EMBED_HTML, "vixsrc.to")
 
-        # 1. Ad scripts must be removed
-        self.assertNotIn("spbgc.com", cleaned)
-        self.assertNotIn("10874703", cleaned)
-        self.assertNotIn("dataset.zone", cleaned)
+        # 1. Ad scripts must be removed (check for the specific injected snippet, not domain name
+        #    since the blocker script itself lists "spbgc.com" in its _adDomains array)
+        self.assertNotIn("s.dataset.zone=", cleaned)          # spbgc ad loader removed
+        self.assertNotIn("10874703", cleaned)                  # ad tag id removed
+        self.assertNotIn("tag.min.js", cleaned)               # ad script src removed
 
         # 2. Anti-sandbox checks must be removed
         self.assertNotIn("Please Disable Sandbox", cleaned)
@@ -69,9 +70,11 @@ class TestCleanEmbed(unittest.TestCase):
         # 5. Base tag must be injected
         self.assertIn('<base href="https://vixsrc.to/">', cleaned)
 
-        # 6. Blocker script must be injected
+        # 6. Blocker script must be injected with all key guards
         self.assertIn("[AdBlock]", cleaned)
         self.assertIn("window.open =", cleaned)
+        self.assertIn("MutationObserver", cleaned)
+        self.assertIn("_clickActive", cleaned)
 
     @patch("main._fetch_embed_page")
     def test_clean_embed_endpoint_success(self, mock_fetch):
@@ -80,9 +83,11 @@ class TestCleanEmbed(unittest.TestCase):
         res = self.client.get("/clean-embed?tmdb=550&type=movie")
         self.assertEqual(res.status_code, 200)
         self.assertIn("text/html", res.headers["content-type"])
-        self.assertNotIn("spbgc.com", res.text)
+        # Verify ad script snippet is gone, not just the domain name
+        self.assertNotIn("s.dataset.zone=", res.text)    # ad tag removed
         self.assertNotIn("Please Disable Sandbox", res.text)
         self.assertIn("jwplayer", res.text)
+        self.assertIn("[AdBlock]", res.text)              # blocker injected
 
     @patch("main._fetch_embed_page")
     def test_clean_embed_endpoint_not_found(self, mock_fetch):

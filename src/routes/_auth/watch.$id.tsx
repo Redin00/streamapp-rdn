@@ -531,6 +531,14 @@ function WatchPage() {
               className="size-full"
               allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
               referrerPolicy="no-referrer"
+              {...(player.cleanEmbed
+                ? {
+                    // Clean embed is served from our domain — safe to sandbox.
+                    // Omitting allow-top-navigation prevents clickunder redirects.
+                    sandbox:
+                      "allow-scripts allow-same-origin allow-presentation allow-pointer-lock",
+                  }
+                : {})}
             />
           </div>
         </div>
