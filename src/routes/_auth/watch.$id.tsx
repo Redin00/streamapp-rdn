@@ -144,8 +144,6 @@ function WatchPage() {
   const playLoggedRef = useRef(false);
   const latestSecondsRef = useRef<number | null>(null);
 
-  const wallClockRef = useRef<{ start: number; position: number; running: boolean } | null>(null);
-  const wallClockTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const playbackDurationSeconds = (activeEpisode?.duration || title?.runtime || 0) * 60;
 
   function clearCompletedMarker() {
@@ -160,64 +158,6 @@ function WatchPage() {
         ) ?? null,
     );
   }
-
-  const startWallClock = (position: number) => {
-    const safePos = Math.max(0, position);
-    if (playbackDurationSeconds > 0 && safePos >= playbackDurationSeconds) {
-      clearCompletedMarker();
-      latestSecondsRef.current = 0;
-      persistMarker(0, true);
-      return;
-    }
-    wallClockRef.current = { start: Date.now(), position: safePos, running: true };
-    latestSecondsRef.current = safePos;
-
-    if (wallClockTimerRef.current) clearInterval(wallClockTimerRef.current);
-    wallClockTimerRef.current = setInterval(() => {
-      if (!wallClockRef.current || !wallClockRef.current.running) return;
-      const elapsed = (Date.now() - wallClockRef.current.start) / 1000;
-      const current = wallClockRef.current.position + elapsed;
-      if (playbackDurationSeconds > 0 && current >= playbackDurationSeconds) {
-        stopWallClock();
-        clearCompletedMarker();
-        persistMarker(0, true);
-        return;
-      }
-      latestSecondsRef.current = current;
-      persistMarker(current, false);
-    }, 5000);
-  };
-
-  const pauseWallClock = () => {
-    if (!wallClockRef.current?.running) return;
-    const elapsed = (Date.now() - wallClockRef.current.start) / 1000;
-    const current = wallClockRef.current.position + elapsed;
-    wallClockRef.current = {
-      start: Date.now(),
-      position: current,
-      running: false,
-    };
-    latestSecondsRef.current = current;
-    if (wallClockTimerRef.current) {
-      clearInterval(wallClockTimerRef.current);
-      wallClockTimerRef.current = null;
-    }
-    persistMarker(current, true);
-  };
-
-  const stopWallClock = (completed = false) => {
-    if (wallClockRef.current?.running) {
-      const elapsed = (Date.now() - wallClockRef.current.start) / 1000;
-      const current = wallClockRef.current.position + elapsed;
-      latestSecondsRef.current = current;
-      persistMarker(completed ? 0 : current, true);
-    }
-    wallClockRef.current = null;
-    if (wallClockTimerRef.current) {
-      clearInterval(wallClockTimerRef.current);
-      wallClockTimerRef.current = null;
-    }
-  };
 
   const slug = title?.slug ?? "";
   const season = activeSeason?.number ?? 0;
@@ -268,24 +208,6 @@ function WatchPage() {
     };
   }, [title, slug, season, episode]);
 
-  // True when the embed iframe is the active player on screen.
-  const isIframeActive = !!(embedUrl && (!playlistUrl || hlsFailed) && !streamQuery.isLoading);
-
-  // When iframe embed is active and marker loaded, initialize position tracking in paused state.
-  // The wall-clock or vixsrc player events will start tracking once playback begins.
-  useEffect(() => {
-    if (!isIframeActive || !markerLoaded) return;
-
-    const initialPos = marker ?? 0;
-    latestSecondsRef.current = initialPos;
-    wallClockRef.current = { start: Date.now(), position: initialPos, running: false };
-
-    return () => {
-      stopWallClock();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isIframeActive, markerLoaded, marker, slug, season, episode]);
-
   // Record a play row the moment playback has a resolvable source, so the
   // title shows up in "recently watched" and resume can find a marker row
   // even if the user stops before the debounced marker write fires.
@@ -313,12 +235,8 @@ function WatchPage() {
   // stored under the same context that produced it.
   useEffect(() => {
     return () => {
-      const seconds =
-        latestSecondsRef.current ??
-        (wallClockRef.current?.running
-          ? wallClockRef.current.position + (Date.now() - wallClockRef.current.start) / 1000
-          : null);
-      if (seconds !== null) {
+      const seconds = latestSecondsRef.current;
+      if (seconds !== null && Number.isFinite(seconds)) {
         if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
         saveDebounceRef.current = null;
         const clamped = Math.max(0, Math.round(seconds));
@@ -376,11 +294,7 @@ function WatchPage() {
   }
 
   function flushMarker() {
-    const seconds =
-      latestSecondsRef.current ??
-      (wallClockRef.current?.running
-        ? wallClockRef.current.position + (Date.now() - wallClockRef.current.start) / 1000
-        : null);
+    const seconds = latestSecondsRef.current;
     if (seconds === null || !title) return;
     persistMarker(seconds, true);
   }
@@ -395,7 +309,7 @@ function WatchPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [markerLoaded, slug, title, season, episode]);
 
-  // Listen for player events (play, pause, seek, ended, timeupdate) to sync wall-clock
+  // Listen for player events (play, pause, seek, ended, timeupdate) from embed players (e.g. Vixsrc)
   useEffect(() => {
     if (!markerLoaded) return;
 
@@ -413,23 +327,20 @@ function WatchPage() {
           }
         } else {
           const lower = trimmed.toLowerCase();
-          if (lower === "play" || lower === "playing" || lower === "start") {
-            if (wallClockRef.current) startWallClock(wallClockRef.current.position);
-            return;
-          }
           if (lower === "pause" || lower === "seeking" || lower === "seek") {
-            pauseWallClock();
+            if (latestSecondsRef.current !== null) {
+              persistMarker(latestSecondsRef.current, true);
+            }
             return;
           }
           if (lower === "ended" || lower === "finish" || lower === "complete") {
-            stopWallClock(true);
             clearCompletedMarker();
+            persistMarker(0, true);
             return;
           }
           if (lower.startsWith("time:")) {
             const parsed = parseFloat(lower.slice(5));
             if (Number.isFinite(parsed) && parsed >= 0) {
-              startWallClock(parsed);
               persistMarker(parsed, false);
             }
             return;
@@ -509,7 +420,6 @@ function WatchPage() {
 
       // Handle video completion
       if (eventName === "ended" || eventName === "complete" || eventName === "finish") {
-        stopWallClock(true);
         clearCompletedMarker();
         persistMarker(0, true);
         return;
@@ -517,7 +427,6 @@ function WatchPage() {
 
       const durationLimit = totalDuration || playbackDurationSeconds;
       if (seconds !== null && durationLimit > 0 && seconds >= durationLimit - 10) {
-        stopWallClock(true);
         clearCompletedMarker();
         persistMarker(0, true);
         return;
@@ -526,12 +435,7 @@ function WatchPage() {
       // Handle seek events (mouse drag/click on progress bar)
       if (eventName === "seeked" || eventName === "seek") {
         if (seconds !== null && Number.isFinite(seconds) && seconds >= 0) {
-          const wasRunning = wallClockRef.current?.running ?? false;
-          latestSecondsRef.current = seconds;
-          wallClockRef.current = { start: Date.now(), position: seconds, running: wasRunning };
           persistMarker(seconds, true);
-        } else {
-          pauseWallClock();
         }
         return;
       }
@@ -539,35 +443,24 @@ function WatchPage() {
       // Handle pause events
       if (eventName === "pause") {
         if (seconds !== null && Number.isFinite(seconds) && seconds >= 0) {
-          latestSecondsRef.current = seconds;
-          wallClockRef.current = { start: Date.now(), position: seconds, running: false };
           persistMarker(seconds, true);
-        } else {
-          pauseWallClock();
+        } else if (latestSecondsRef.current !== null) {
+          persistMarker(latestSecondsRef.current, true);
         }
         return;
       }
 
       // Handle play events
       if (eventName === "play" || eventName === "playing" || eventName === "start") {
-        const pos =
-          seconds !== null && Number.isFinite(seconds) && seconds >= 0
-            ? seconds
-            : (wallClockRef.current?.position ?? marker ?? 0);
-        startWallClock(pos);
+        if (seconds !== null && Number.isFinite(seconds) && seconds >= 0) {
+          latestSecondsRef.current = seconds;
+        }
         return;
       }
 
       // Handle timeupdate events (sent continuously while playing)
       if (eventName === "timeupdate" || eventName === "time") {
         if (seconds !== null && Number.isFinite(seconds) && seconds >= 0) {
-          latestSecondsRef.current = seconds;
-          if (!wallClockRef.current || !wallClockRef.current.running) {
-            wallClockRef.current = { start: Date.now(), position: seconds, running: true };
-          } else {
-            wallClockRef.current.position = seconds;
-            wallClockRef.current.start = Date.now();
-          }
           persistMarker(seconds, false);
         }
         return;
@@ -575,11 +468,6 @@ function WatchPage() {
 
       // Generic fallback if seconds were extracted
       if (seconds !== null && Number.isFinite(seconds) && seconds >= 0) {
-        latestSecondsRef.current = seconds;
-        if (wallClockRef.current?.running) {
-          wallClockRef.current.position = seconds;
-          wallClockRef.current.start = Date.now();
-        }
         persistMarker(seconds, false);
       }
     };
