@@ -521,13 +521,16 @@ function WatchPage() {
           {showFallbackNotice ? (
             <p className="text-xs text-muted-foreground">{t("watch_unavailable")}</p>
           ) : null}
-          {adBlockPrompt.shouldShow ? <AdBlockPrompt browser={adBlockPrompt.info.browser} /> : null}
+          {!player.cleanEmbed && adBlockPrompt.shouldShow ? (
+            <AdBlockPrompt browser={adBlockPrompt.info.browser} />
+          ) : null}
           <div className="aspect-video w-full overflow-hidden rounded-xl border border-border bg-black">
             <iframe
               src={resumeEmbedUrl ?? embedUrl}
               title={`${title.name} player`}
               className="size-full"
               allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
+              sandbox="allow-scripts allow-same-origin allow-forms allow-presentation"
               referrerPolicy="no-referrer"
             />
           </div>

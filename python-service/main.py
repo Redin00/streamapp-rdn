@@ -659,10 +659,15 @@ def _scrape(pattern: str, page: str, what: str) -> str:
     return match.group(1)
 
 
-def resolve_playlist(
-    tmdb_id: int, media_type: str, season: Optional[int] = None, episode: Optional[int] = None
-) -> Optional[Dict[str, Any]]:
-    """Resolve a playable HLS master playlist, or None if the host lacks the title."""
+def _fetch_embed_page(
+    tmdb_id: int,
+    media_type: str,
+    season: Optional[int] = None,
+    episode: Optional[int] = None,
+    start_at: Optional[int] = None,
+) -> Optional[tuple[str, str]]:
+    """Fetch the raw embed HTML page from Vixsrc. Returns (page_html, domain) or None if 404."""
+    global VIXSRC_DOMAIN
     base = f"https://{VIXSRC_DOMAIN}"
     kind = "tv" if media_type == "tv" else "movie"
     suffix = f"/{season}/{episode}" if season and episode else ""
@@ -690,7 +695,7 @@ def resolve_playlist(
         and _is_valid_vixsrc_redirect(final_host, res.text[:2000] if hasattr(res, "text") else "")
     ):
         log.info(
-            "resolve_playlist followed redirect: %s -> %s; updating playback domain",
+            "resolve followed redirect: %s -> %s; updating playback domain",
             VIXSRC_DOMAIN,
             final_host,
         )
@@ -710,6 +715,10 @@ def resolve_playlist(
         raise RuntimeError("playback host returned no embed source")
 
     embed_url = src if src.startswith("http") else base + src
+    if start_at is not None and start_at > 0:
+        sep = "&" if "?" in embed_url else "?"
+        embed_url = f"{embed_url}{sep}startAt={int(start_at)}"
+
     try:
         page_res = vixsrc_session.get(embed_url, headers={"referer": referer}, timeout=20)
         page = page_res.text
@@ -733,10 +742,103 @@ def resolve_playlist(
             base = f"https://{VIXSRC_DOMAIN}"
             referer = f"{base}/{kind}/{tmdb_id}{suffix}"
             embed_url = src if src.startswith("http") else base + src
+            if start_at is not None and start_at > 0:
+                sep = "&" if "?" in embed_url else "?"
+                embed_url = f"{embed_url}{sep}startAt={int(start_at)}"
             page_res = vixsrc_session.get(embed_url, headers={"referer": referer}, timeout=20)
             page = page_res.text
         else:
             raise
+
+    return page, VIXSRC_DOMAIN
+
+
+def clean_embed_html(html: str, domain: str) -> str:
+    """Sanitize Vixsrc embed HTML by stripping intrusive ad scripts, anti-sandbox,
+
+    and anti-debugger loops while preserving JWPlayer and playback functionality.
+    """
+    # 1. Base tag so relative assets (/jwplayer-..., fonts, icons) resolve against Vixsrc
+    base_tag = f'<base href="https://{domain}/">\n'
+    if "<head>" in html:
+        html = html.replace("<head>", f"<head>\n    {base_tag}", 1)
+    elif "<HEAD>" in html:
+        html = html.replace("<HEAD>", f"<HEAD>\n    {base_tag}", 1)
+    else:
+        html = base_tag + html
+
+    # 2. Defensive blocker script (neutralizes window.open and intercepts unauthorized link navigations)
+    blocker_script = """<script>
+(function() {
+    window.open = function() {
+        console.log('[AdBlock] Blocked window.open popup attempt');
+        return null;
+    };
+    window.addEventListener('click', function(e) {
+        var target = e.target;
+        while (target && target.tagName !== 'A') {
+            target = target.parentElement;
+        }
+        if (target && target.tagName === 'A') {
+            var href = target.getAttribute('href') || '';
+            if (href.startsWith('http') && !href.includes(window.location.hostname)) {
+                e.preventDefault();
+                e.stopPropagation();
+                console.log('[AdBlock] Blocked external link navigation to', href);
+            }
+        }
+    }, true);
+})();
+</script>
+"""
+    html = html.replace(base_tag, base_tag + blocker_script, 1)
+
+    # 3. Strip ad scripts, anti-sandbox, and anti-debugger
+    def should_remove(script_block: str) -> bool:
+        lower = script_block.lower()
+        # Ad networks (HilltopAds / PropellerAds / spbgc.com / etc.)
+        if "spbgc.com" in lower or "dataset.zone" in lower or "hilltopads" in lower or "propellerads" in lower:
+            return True
+        # Anti-sandbox checks
+        if "sandboxed iframe detected" in lower or "please disable sandbox" in lower:
+            return True
+        # Anti-debugger / devtools loops
+        if "minimaluserresponseinmiliseconds" in lower or "debugger;" in lower or "isdevtoolsopened" in lower:
+            return True
+        return False
+
+    html = re.sub(
+        r"<script[\s\S]*?</script>",
+        lambda m: "" if should_remove(m.group(0)) else m.group(0),
+        html,
+        flags=re.IGNORECASE,
+    )
+    return html
+
+
+def resolve_clean_embed(
+    tmdb_id: int,
+    media_type: str,
+    season: Optional[int] = None,
+    episode: Optional[int] = None,
+    start_at: Optional[int] = None,
+) -> Optional[str]:
+    """Fetch and sanitize the Vixsrc embed HTML, removing ads and protections."""
+    result = _fetch_embed_page(tmdb_id, media_type, season, episode, start_at)
+    if result is None:
+        return None
+    page, domain = result
+    return clean_embed_html(page, domain)
+
+
+def resolve_playlist(
+    tmdb_id: int, media_type: str, season: Optional[int] = None, episode: Optional[int] = None
+) -> Optional[Dict[str, Any]]:
+    """Resolve a playable HLS master playlist, or None if the host lacks the title."""
+    result = _fetch_embed_page(tmdb_id, media_type, season, episode)
+    if result is None:
+        return None
+    page, _ = result
 
     raw_params = _scrape(
         r"window\.masterPlaylist[^:]+params:[^{]+({[^<]+?})", page, "playlist params"
@@ -763,7 +865,7 @@ def resolve_playlist(
         + f"expires={params['expires']}&token={params['token']}"
         + ("&h=1" if fhd else "")
     )
-    log.debug("resolved playlist for %s %s (fhd=%s)", kind, tmdb_id, fhd)
+    log.debug("resolved playlist for %s %s (fhd=%s)", media_type, tmdb_id, fhd)
     return {"playlistUrl": playlist, "expiresAt": int(params["expires"]), "fhd": fhd}
 
 
@@ -820,6 +922,7 @@ def player():
         "provider": "vixsrc",
         "domain": vixsrc_domain,
         "enabled": bool(vixsrc_domain),
+        "cleanEmbed": True,
     }
 
 
@@ -849,6 +952,38 @@ def stream(
     if resolved is None:
         raise HTTPException(status_code=404, detail="title not available on the playback host")
     return {"provider": "vixsrc", **resolved}
+
+
+@app.get("/clean-embed")
+def clean_embed_endpoint(
+    tmdb: int = Query(..., gt=0),
+    type: str = Query("movie", pattern="^(movie|tv)$"),
+    s: Optional[int] = Query(None, gt=0),
+    e: Optional[int] = Query(None, gt=0),
+    startAt: Optional[int] = Query(None, ge=0),
+):
+    """Cleaned Vixsrc playback embed without ads, popups, or anti-sandbox protections."""
+    if not VIXSRC_DOMAIN:
+        raise HTTPException(status_code=503, detail="no playback host configured")
+    if type == "tv" and not (s and e):
+        raise HTTPException(status_code=422, detail="series need both s and e")
+
+    try:
+        html = resolve_clean_embed(tmdb, type, s, e, startAt)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.exception("clean-embed %s %s failed", type, tmdb)
+        raise HTTPException(status_code=502, detail=f"could not fetch embed: {exc}")
+
+    if html is None:
+        raise HTTPException(status_code=404, detail="title not available on the playback host")
+
+    return Response(
+        content=html,
+        media_type="text/html; charset=utf-8",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 @app.get("/search")
