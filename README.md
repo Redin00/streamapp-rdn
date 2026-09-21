@@ -96,7 +96,3 @@ The Python service reports the active playback host at `GET /player`.
 
 Embed hosts rotate and may serve content you are not licensed to view — keep the
 host configurable rather than hardcoded, and check what you are pointing it at.
-
-Watched time gets saved by using a clock that counts how many seconds/minutes you were watching
-a tv show or a movie. Unluckily, due to vixsrc events not working properly, there isn't another way
-to record resume time in a better way ;(( (or atleast not for me lol).

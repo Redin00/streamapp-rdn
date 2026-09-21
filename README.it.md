@@ -96,7 +96,3 @@ Il servizio Python indica il provider attivo tramite `GET /player`.
 I domini di embed possono cambiare e possono offrire contenuti che non hai il
 diritto di vedere. Mantieni il dominio configurabile e verifica di avere i
 diritti necessari per i contenuti a cui accedi.
-
-Il tempo di visione viene salvato tramite un contatore dei secondi o dei minuti
-di riproduzione. A causa del funzionamento non affidabile degli eventi Vixsrc,
-non è possibile registrare il punto di ripresa in modo più preciso.
