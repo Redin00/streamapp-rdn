@@ -186,7 +186,7 @@ export const createAccount = createServerFn({ method: "POST" })
         name: account.name,
         color: account.color,
         locked: false,
-        profilePicture: account.profilePicture,
+        ...(account.profilePicture ? { profilePicture: account.profilePicture } : {}),
       });
       return { ok: true, data: account };
     }

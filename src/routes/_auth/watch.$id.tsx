@@ -30,6 +30,31 @@ const playerQuery = queryOptions({
   queryFn: () => getPlayerConfig(),
 });
 
+interface PlayerEventData {
+  event?: string | undefined;
+  currentTime?: number | undefined;
+  duration?: number | undefined;
+  time?: number | undefined;
+  seconds?: number | undefined;
+  position?: number | undefined;
+  value?: number | undefined;
+  video_id?: string | undefined;
+}
+
+interface PlayerMessagePayload {
+  type?: string | undefined;
+  event?: PlayerEventData | string | undefined;
+  data?: PlayerEventData | undefined;
+  info?: PlayerEventData | undefined;
+  payload?: PlayerEventData | undefined;
+  currentTime?: number | undefined;
+  duration?: number | undefined;
+  time?: number | undefined;
+  seconds?: number | undefined;
+  position?: number | undefined;
+  value?: number | undefined;
+}
+
 export const Route = createFileRoute("/_auth/watch/$id")({
   validateSearch: (search: Record<string, unknown>) => {
     const parsed = z
@@ -197,15 +222,16 @@ function WatchPage() {
   const slug = title?.slug ?? "";
   const season = activeSeason?.number ?? 0;
   const episode = activeEpisode?.number ?? 0;
-  const resumeEmbedUrl = embedUrl
-    ? buildEmbedUrl(player, {
-        tmdbId: title.tmdbId!,
-        type: title.type,
-        season: activeSeason?.number,
-        episode: activeEpisode?.number,
-        startAt: marker ?? undefined,
-      })
-    : null;
+  const resumeEmbedUrl =
+    embedUrl && title?.tmdbId
+      ? buildEmbedUrl(player, {
+          tmdbId: title.tmdbId,
+          type: title.type,
+          season: activeSeason?.number,
+          episode: activeEpisode?.number,
+          startAt: marker ?? undefined,
+        })
+      : null;
 
   // Load the marker from the server first; fall back to a localStorage copy
   // that was saved as a cross-session safety net when the service was down.
@@ -245,11 +271,14 @@ function WatchPage() {
   // True when the embed iframe is the active player on screen.
   const isIframeActive = !!(embedUrl && (!playlistUrl || hlsFailed) && !streamQuery.isLoading);
 
-  // When iframe embed is active, start clock-based tracking seeded from saved marker
+  // When iframe embed is active and marker loaded, initialize position tracking in paused state.
+  // The wall-clock or vixsrc player events will start tracking once playback begins.
   useEffect(() => {
     if (!isIframeActive || !markerLoaded) return;
 
-    startWallClock(marker ?? 0);
+    const initialPos = marker ?? 0;
+    latestSecondsRef.current = initialPos;
+    wallClockRef.current = { start: Date.now(), position: initialPos, running: false };
 
     return () => {
       stopWallClock();
@@ -321,6 +350,15 @@ function WatchPage() {
       void updateWatchMarker({
         data: { slug, title, season, episode, marker: clamped },
       });
+      queryClient.setQueryData<WatchEntry[] | null>(
+        historyQuery.queryKey,
+        (current) =>
+          current?.map((entry) =>
+            entry.slug === slug && entry.season === season && entry.episode === episode
+              ? { ...entry, marker: clamped }
+              : entry,
+          ) ?? null,
+      );
       // Persist to localStorage as a cross-session fallback so the resume
       // marker survives even when the streaming service is unreachable.
       try {
@@ -354,6 +392,7 @@ function WatchPage() {
     return () => {
       window.removeEventListener("pagehide", flushMarker);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [markerLoaded, slug, title, season, episode]);
 
   // Listen for player events (play, pause, seek, ended, timeupdate) to sync wall-clock
@@ -365,32 +404,7 @@ function WatchPage() {
 
       // Handle string messages
       if (typeof data === "string") {
-        const trimmed = data.trim().toLowerCase();
-        if (trimmed === "play" || trimmed === "playing" || trimmed === "start") {
-          if (wallClockRef.current) {
-            startWallClock(wallClockRef.current.position);
-          }
-          return;
-        }
-        if (trimmed === "pause") {
-          pauseWallClock();
-          return;
-        }
-        if (trimmed === "seek" || trimmed === "seeking" || trimmed === "seeked") {
-          pauseWallClock();
-          return;
-        }
-        if (trimmed === "ended" || trimmed === "finish" || trimmed === "complete") {
-          stopWallClock(true);
-          return;
-        }
-        if (trimmed.startsWith("time:")) {
-          const parsed = parseFloat(trimmed.slice(5));
-          if (Number.isFinite(parsed) && parsed >= 0) {
-            startWallClock(parsed);
-          }
-          return;
-        }
+        const trimmed = data.trim();
         if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
           try {
             data = JSON.parse(trimmed);
@@ -398,60 +412,181 @@ function WatchPage() {
             return;
           }
         } else {
+          const lower = trimmed.toLowerCase();
+          if (lower === "play" || lower === "playing" || lower === "start") {
+            if (wallClockRef.current) startWallClock(wallClockRef.current.position);
+            return;
+          }
+          if (lower === "pause" || lower === "seeking" || lower === "seek") {
+            pauseWallClock();
+            return;
+          }
+          if (lower === "ended" || lower === "finish" || lower === "complete") {
+            stopWallClock(true);
+            clearCompletedMarker();
+            return;
+          }
+          if (lower.startsWith("time:")) {
+            const parsed = parseFloat(lower.slice(5));
+            if (Number.isFinite(parsed) && parsed >= 0) {
+              startWallClock(parsed);
+              persistMarker(parsed, false);
+            }
+            return;
+          }
           return;
         }
       }
 
-      // Handle object messages
       if (!data || typeof data !== "object") return;
-      const record = data as Record<string, unknown>;
+      const record = data as PlayerMessagePayload;
 
-      const rawEvent =
-        (record.event as string | undefined) ??
-        (record.type as string | undefined) ??
-        ((record.data as Record<string, unknown> | undefined)?.event as string | undefined);
-      const eventName = String(rawEvent ?? "").toLowerCase();
+      // Vixsrc sends { type: "PLAYER_EVENT", event: { event: "timeupdate"|"seeked"|"play"|"pause"|"ended", currentTime: ..., duration: ... } }
+      // Some versions send { type: "PLAYER_EVENT", data: { event: "...", currentTime: ..., duration: ... } }
+      let eventName = "";
+      let seconds: number | null = null;
+      let totalDuration: number | null = null;
 
-      if (eventName.includes("play") || eventName.includes("start")) {
-        if (wallClockRef.current) startWallClock(wallClockRef.current.position);
-      } else if (eventName.includes("pause")) {
-        pauseWallClock();
-      } else if (eventName.includes("seek")) {
-        pauseWallClock();
-      } else if (eventName.includes("ended") || eventName.includes("finish")) {
-        stopWallClock(true);
-        clearCompletedMarker();
+      if (typeof record.event === "object" && record.event !== null) {
+        const evObj = record.event;
+        if (typeof evObj.event === "string") eventName = evObj.event.toLowerCase();
+        if (typeof evObj.currentTime === "number") seconds = evObj.currentTime;
+        if (typeof evObj.duration === "number") totalDuration = evObj.duration;
+      } else if (typeof record.event === "string") {
+        eventName = record.event.toLowerCase();
       }
 
-      const info = (record.info ?? record.data ?? record.payload ?? record) as Record<
-        string,
-        unknown
-      >;
-      const rawSeconds =
-        info.currentTime ??
-        info.time ??
-        info.seconds ??
-        info.position ??
-        info.value ??
-        record.currentTime ??
-        record.time ??
-        record.seconds ??
-        record.value;
+      if (typeof record.data === "object" && record.data !== null) {
+        const dataObj = record.data;
+        if (!eventName && typeof dataObj.event === "string") {
+          eventName = dataObj.event.toLowerCase();
+        }
+        if (seconds === null && typeof dataObj.currentTime === "number") {
+          seconds = dataObj.currentTime;
+        }
+        if (totalDuration === null && typeof dataObj.duration === "number") {
+          totalDuration = dataObj.duration;
+        }
+      }
 
-      const seconds =
-        typeof rawSeconds === "number"
-          ? rawSeconds
-          : typeof rawSeconds === "string"
-            ? Number(rawSeconds)
-            : Number.NaN;
+      if (!eventName && typeof record.type === "string" && record.type !== "PLAYER_EVENT") {
+        eventName = record.type.toLowerCase();
+      }
 
-      if (Number.isFinite(seconds) && seconds >= 0) {
-        startWallClock(seconds);
+      // Fallback search for seconds in any payload object
+      if (seconds === null) {
+        const candidates = [record, record.data, record.event, record.info, record.payload];
+        for (const cand of candidates) {
+          if (cand && typeof cand === "object") {
+            const c = cand as PlayerEventData;
+            const val = c.currentTime ?? c.time ?? c.seconds ?? c.position ?? c.value;
+            const num =
+              typeof val === "number" ? val : typeof val === "string" ? parseFloat(val) : NaN;
+            if (Number.isFinite(num) && num >= 0) {
+              seconds = num;
+              break;
+            }
+          }
+        }
+      }
+
+      // Fallback search for total duration
+      if (totalDuration === null) {
+        const candidates = [record, record.data, record.event, record.info, record.payload];
+        for (const cand of candidates) {
+          if (cand && typeof cand === "object") {
+            const c = cand as PlayerEventData;
+            const val = c.duration;
+            const num =
+              typeof val === "number" ? val : typeof val === "string" ? parseFloat(val) : NaN;
+            if (Number.isFinite(num) && num > 0) {
+              totalDuration = num;
+              break;
+            }
+          }
+        }
+      }
+
+      // Handle video completion
+      if (eventName === "ended" || eventName === "complete" || eventName === "finish") {
+        stopWallClock(true);
+        clearCompletedMarker();
+        persistMarker(0, true);
+        return;
+      }
+
+      const durationLimit = totalDuration || playbackDurationSeconds;
+      if (seconds !== null && durationLimit > 0 && seconds >= durationLimit - 10) {
+        stopWallClock(true);
+        clearCompletedMarker();
+        persistMarker(0, true);
+        return;
+      }
+
+      // Handle seek events (mouse drag/click on progress bar)
+      if (eventName === "seeked" || eventName === "seek") {
+        if (seconds !== null && Number.isFinite(seconds) && seconds >= 0) {
+          const wasRunning = wallClockRef.current?.running ?? false;
+          latestSecondsRef.current = seconds;
+          wallClockRef.current = { start: Date.now(), position: seconds, running: wasRunning };
+          persistMarker(seconds, true);
+        } else {
+          pauseWallClock();
+        }
+        return;
+      }
+
+      // Handle pause events
+      if (eventName === "pause") {
+        if (seconds !== null && Number.isFinite(seconds) && seconds >= 0) {
+          latestSecondsRef.current = seconds;
+          wallClockRef.current = { start: Date.now(), position: seconds, running: false };
+          persistMarker(seconds, true);
+        } else {
+          pauseWallClock();
+        }
+        return;
+      }
+
+      // Handle play events
+      if (eventName === "play" || eventName === "playing" || eventName === "start") {
+        const pos =
+          seconds !== null && Number.isFinite(seconds) && seconds >= 0
+            ? seconds
+            : (wallClockRef.current?.position ?? marker ?? 0);
+        startWallClock(pos);
+        return;
+      }
+
+      // Handle timeupdate events (sent continuously while playing)
+      if (eventName === "timeupdate" || eventName === "time") {
+        if (seconds !== null && Number.isFinite(seconds) && seconds >= 0) {
+          latestSecondsRef.current = seconds;
+          if (!wallClockRef.current || !wallClockRef.current.running) {
+            wallClockRef.current = { start: Date.now(), position: seconds, running: true };
+          } else {
+            wallClockRef.current.position = seconds;
+            wallClockRef.current.start = Date.now();
+          }
+          persistMarker(seconds, false);
+        }
+        return;
+      }
+
+      // Generic fallback if seconds were extracted
+      if (seconds !== null && Number.isFinite(seconds) && seconds >= 0) {
+        latestSecondsRef.current = seconds;
+        if (wallClockRef.current?.running) {
+          wallClockRef.current.position = seconds;
+          wallClockRef.current.start = Date.now();
+        }
+        persistMarker(seconds, false);
       }
     };
 
     window.addEventListener("message", handlePlayerMessage);
     return () => window.removeEventListener("message", handlePlayerMessage);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [markerLoaded, slug, title, season, episode]);
 
   if (!title) return null;

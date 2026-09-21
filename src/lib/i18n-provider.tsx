@@ -12,14 +12,6 @@ import { type Locale, LANGUAGES, DEFAULT_LOCALE, IT, EN } from "./i18n";
 
 const STORAGE_KEY = "streamapp-locale";
 
-declare global {
-  namespace AppData {
-    interface Locales {
-      locale: Locale;
-    }
-  }
-}
-
 interface LocaleContextValue {
   locale: Locale;
   setLocale: (locale: Locale) => void;

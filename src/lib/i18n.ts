@@ -177,6 +177,7 @@ export const EN = {
   misc_error: "Something went wrong. Please try again.",
   misc_retry: "Retry",
   misc_close: "Close",
+  language_label: "Language",
   admin_resetPasswordTitle: "Reset password",
   admin_resetPasswordDescription:
     "This will allow the user to set a new password on their next login.",
@@ -298,8 +299,12 @@ export const IT = {
   changePassword_error: "Impossibile aggiornare. Controlla la tua password attuale.",
   uploadProfilePicture_title: "Cambia immagine profilo",
   uploadProfilePicture_description: "Imposta un'immagine profilo. JPEG o PNG, massimo 2 MB.",
+  uploadProfilePicture_description_existing:
+    "Sostituisci l'immagine profilo. JPEG o PNG, massimo 2 MB.",
   uploadProfilePicture_description_name:
     "Imposta un'immagine profilo per {name}. JPEG o PNG, massimo 2 MB.",
+  uploadProfilePicture_description_existing_name:
+    "Sostituisci l'immagine profilo per {name}. JPEG o PNG, massimo 2 MB.",
   uploadProfilePicture_url: "URL dell'immagine",
   uploadProfilePicture_uploadFile: "Carica immagine",
   uploadProfilePicture_save: "Salva",
@@ -421,6 +426,8 @@ export const IT = {
   admin_resetSuccess: "Password reimpostata con successo.",
   admin_resetError: "Impossibile reimpostare la password.",
   dashboard_recentlyAdded: "Aggiunti recentemente",
+  dashboard_sampleNotice:
+    "Visualizzazione dati di catalogo di esempio. Connetti il servizio StreamingCommunity per caricare i titoli reali.",
   watch_backToDetails: "Torna ai dettagli",
   watch_resume: "Riprendi",
   watch_resumeTitle: "Riprendi visione",
