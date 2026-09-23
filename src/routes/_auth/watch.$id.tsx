@@ -304,6 +304,10 @@ function WatchPage() {
         setVixsrcStartAt(t);
         setVixsrcAutoplay(false);
         setVixsrcIframeKey((k) => k + 1);
+        // Force a pause command after the iframe reload (some players ignore autoplay=0)
+        setTimeout(() => {
+          sendIframePlayerCommand(iframeRef.current, "pause");
+        }, 300);
       }
     },
     [playlistUrl, hlsFailed],
