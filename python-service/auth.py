@@ -288,6 +288,12 @@ def _open_session(conn, account_id: int, stamp: int) -> str:
     return token
 
 
+def create_session(account_id: int) -> str:
+    """Convenience helper to create a session token for an account id."""
+    with connect() as conn:
+        return _open_session(conn, account_id, now())
+
+
 @router.post("/auth/login")
 def login(body: LoginRequest) -> Dict[str, Any]:
     stamp = now()

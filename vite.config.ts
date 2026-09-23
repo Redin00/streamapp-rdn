@@ -21,6 +21,17 @@ export default defineConfig(({ command, mode }) => {
           },
         }
       : {}),
+    server: {
+      proxy: {
+        "/ws": {
+          target:
+            process.env["STREAMING_API_URL"] ||
+            `http://localhost:${process.env["SC_PORT"] || 8000}`,
+          ws: true,
+          changeOrigin: true,
+        },
+      },
+    },
     css: { transformer: "lightningcss" as const },
     resolve: {
       alias: { "@": `${process.cwd()}/src` },

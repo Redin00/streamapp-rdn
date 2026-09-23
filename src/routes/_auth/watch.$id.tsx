@@ -1,11 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, createFileRoute, notFound } from "@tanstack/react-router";
 import { queryOptions, useQuery, useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
-import { ArrowLeft, Loader2 } from "lucide-react";
+import { ArrowLeft, Loader2, Users } from "lucide-react";
 import { z } from "zod";
 
-import { HlsPlayer } from "@/components/HlsPlayer";
+import { HlsPlayer, type HlsPlayerHandle } from "@/components/HlsPlayer";
 import { AdBlockPrompt, useAdBlockPrompt } from "@/components/AdBlockPrompt";
+import { WatchTogetherDialog } from "@/components/WatchTogetherDialog";
+import { Button } from "@/components/ui/button";
 import { useBrowserInfo } from "@/hooks/use-browser-info";
 import { historyQuery } from "@/lib/auth/queries";
 import type { WatchEntry } from "@/lib/auth/types";
@@ -13,8 +15,10 @@ import {
   getWatchMarker,
   recordPlay,
   updateWatchMarker,
-  formatWatchPosition,
 } from "@/lib/library.functions";
+import { useWatchParty } from "@/lib/party/party-client";
+import { createPartyRoom } from "@/lib/party/party.functions";
+import type { PartyMedia } from "@/lib/party/types";
 import { getPlayerConfig, getStreamSource, getTitle } from "@/lib/streaming.functions";
 import { buildEmbedUrl } from "@/lib/streaming/player";
 import { useTranslation } from "@/lib/i18n-hook";
@@ -55,12 +59,39 @@ interface PlayerMessagePayload {
   value?: number | undefined;
 }
 
+function sendIframePlayerCommand(
+  iframe: HTMLIFrameElement | null,
+  command: "play" | "pause" | "seek",
+  time?: number,
+) {
+  if (!iframe || !iframe.contentWindow) return;
+  const cw = iframe.contentWindow;
+  if (command === "seek" && typeof time === "number") {
+    cw.postMessage({ type: "seek", time }, "*");
+    cw.postMessage({ method: "seek", value: time }, "*");
+    cw.postMessage({ event: "seek", time }, "*");
+    cw.postMessage({ action: "seek", value: time }, "*");
+    cw.postMessage(`seek:${time}`, "*");
+  } else if (command === "play") {
+    cw.postMessage({ type: "play" }, "*");
+    cw.postMessage({ method: "play" }, "*");
+    cw.postMessage({ action: "play" }, "*");
+    cw.postMessage("play", "*");
+  } else if (command === "pause") {
+    cw.postMessage({ type: "pause" }, "*");
+    cw.postMessage({ method: "pause" }, "*");
+    cw.postMessage({ action: "pause" }, "*");
+    cw.postMessage("pause", "*");
+  }
+}
+
 export const Route = createFileRoute("/_auth/watch/$id")({
   validateSearch: (search: Record<string, unknown>) => {
     const parsed = z
       .object({
         s: z.coerce.number().int().positive().optional(),
         e: z.coerce.number().int().positive().optional(),
+        party: z.string().optional(),
       })
       .safeParse(search);
     return parsed.success ? parsed.data : {};
@@ -88,7 +119,8 @@ export const Route = createFileRoute("/_auth/watch/$id")({
 
 function WatchPage() {
   const { id } = Route.useParams();
-  const { s, e } = Route.useSearch();
+  const { s, e, party: searchPartyCode } = Route.useSearch();
+  const navigate = Route.useNavigate();
   const queryClient = useQueryClient();
   const { data: title } = useSuspenseQuery(titleQuery(id));
   const { data: player } = useSuspenseQuery(playerQuery);
@@ -146,6 +178,10 @@ function WatchPage() {
 
   const playbackDurationSeconds = (activeEpisode?.duration || title?.runtime || 0) * 60;
 
+  const slug = title?.slug ?? "";
+  const season = activeSeason?.number ?? 0;
+  const episode = activeEpisode?.number ?? 0;
+
   function clearCompletedMarker() {
     setMarker(null);
     queryClient.setQueryData<WatchEntry[] | null>(
@@ -159,9 +195,231 @@ function WatchPage() {
     );
   }
 
-  const slug = title?.slug ?? "";
-  const season = activeSeason?.number ?? 0;
-  const episode = activeEpisode?.number ?? 0;
+  // Check search param first, then fallback to sessionStorage
+  const [partyCode, setPartyCode] = useState<string | null>(() => {
+    if (searchPartyCode) return searchPartyCode.trim().toUpperCase();
+    if (typeof window !== "undefined") {
+      try {
+        const stored = sessionStorage.getItem("cinemagic_watch_party");
+        if (stored) return stored.trim().toUpperCase();
+      } catch {
+        // Ignore
+      }
+    }
+    return null;
+  });
+  const [partyDialogOpen, setPartyDialogOpen] = useState(Boolean(searchPartyCode));
+  const [isLocalPlaying, setIsLocalPlaying] = useState(false);
+  const [vixsrcStartAt, setVixsrcStartAt] = useState<number | null>(null);
+
+  const hlsPlayerRef = useRef<HlsPlayerHandle>(null);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const lastBroadcastMediaRef = useRef<string>("");
+
+  useEffect(() => {
+    if (searchPartyCode) {
+      const clean = searchPartyCode.trim().toUpperCase();
+      if (clean !== partyCode) {
+        setPartyCode(clean);
+      }
+      try {
+        sessionStorage.setItem("cinemagic_watch_party", clean);
+      } catch {}
+    }
+  }, [searchPartyCode, partyCode]);
+
+  useEffect(() => {
+    if (partyCode) {
+      try {
+        sessionStorage.setItem("cinemagic_watch_party", partyCode);
+      } catch {}
+    }
+  }, [partyCode]);
+
+  const onRemotePlay = useCallback(
+    (time: number) => {
+      setIsLocalPlaying(true);
+      if (playlistUrl && !hlsFailed) {
+        hlsPlayerRef.current?.seek(time);
+        hlsPlayerRef.current?.play();
+      } else {
+        sendIframePlayerCommand(iframeRef.current, "seek", time);
+        sendIframePlayerCommand(iframeRef.current, "play");
+      }
+    },
+    [playlistUrl, hlsFailed],
+  );
+
+  const onRemotePause = useCallback(
+    (time: number) => {
+      setIsLocalPlaying(false);
+      if (playlistUrl && !hlsFailed) {
+        hlsPlayerRef.current?.seek(time);
+        hlsPlayerRef.current?.pause();
+      } else {
+        sendIframePlayerCommand(iframeRef.current, "seek", time);
+        sendIframePlayerCommand(iframeRef.current, "pause");
+      }
+    },
+    [playlistUrl, hlsFailed],
+  );
+
+  const onRemoteSeek = useCallback(
+    (time: number) => {
+      latestSecondsRef.current = time;
+      if (playlistUrl && !hlsFailed) {
+        hlsPlayerRef.current?.seek(time);
+      } else {
+        sendIframePlayerCommand(iframeRef.current, "seek", time);
+        setVixsrcStartAt(Math.floor(time));
+      }
+    },
+    [playlistUrl, hlsFailed],
+  );
+
+  const onRemoteMediaChange = useCallback(
+    (media: PartyMedia, roomCode?: string) => {
+      const isDifferentSlug = Boolean(media.slug && media.slug !== slug);
+      const targetSeason = media.type === "tv" ? (media.season ?? 1) : undefined;
+      const targetEpisode = media.type === "tv" ? (media.episode ?? 1) : undefined;
+      const currentSeason = activeSeason?.number;
+      const currentEpisode = activeEpisode?.number;
+
+      const isDifferentEpisode =
+        media.type === "tv" &&
+        (targetSeason !== currentSeason || targetEpisode !== currentEpisode);
+
+      if (isDifferentSlug || isDifferentEpisode) {
+        const code = (roomCode || partyCode || searchPartyCode || "").trim().toUpperCase();
+        if (code) {
+          try {
+            sessionStorage.setItem("cinemagic_watch_party", code);
+          } catch {}
+        }
+        void navigate({
+          to: "/watch/$id",
+          params: { id: media.slug },
+          search: {
+            s: targetSeason,
+            e: targetEpisode,
+            party: code || undefined,
+          },
+        });
+      }
+    },
+    [slug, activeSeason, activeEpisode, navigate, partyCode, searchPartyCode],
+  );
+
+  const getCurrentTime = useCallback(() => {
+    if (playlistUrl && !hlsFailed && hlsPlayerRef.current) {
+      return hlsPlayerRef.current.getCurrentTime();
+    }
+    return latestSecondsRef.current ?? 0;
+  }, [playlistUrl, hlsFailed]);
+
+  const getIsPlaying = useCallback(() => {
+    if (playlistUrl && !hlsFailed && hlsPlayerRef.current) {
+      return hlsPlayerRef.current.getIsPlaying();
+    }
+    return isLocalPlaying;
+  }, [playlistUrl, hlsFailed, isLocalPlaying]);
+
+  const party = useWatchParty({
+    roomCode: partyCode,
+    onRemotePlay,
+    onRemotePause,
+    onRemoteSeek,
+    onRemoteMediaChange,
+    getCurrentTime,
+    getIsPlaying,
+  });
+
+  // Host broadcasts media changes when switching episodes
+  useEffect(() => {
+    if (!party.isHost || !party.room || !title) return;
+    const mediaKey = `${slug}:${season}:${episode}`;
+    if (lastBroadcastMediaRef.current === mediaKey) return;
+    lastBroadcastMediaRef.current = mediaKey;
+    party.sendChangeMedia(
+      {
+        slug,
+        tmdbId: title.tmdbId,
+        type: title.type,
+        season: activeSeason?.number,
+        episode: activeEpisode?.number,
+        titleName: title.name,
+      },
+      latestSecondsRef.current ?? 0,
+    );
+  }, [party.isHost, party.room, party.sendChangeMedia, slug, season, episode, title, activeSeason, activeEpisode]);
+
+  const handleCreateParty = async () => {
+    if (!title) return;
+    try {
+      const res = await createPartyRoom({
+        data: {
+          media: {
+            slug,
+            tmdbId: title.tmdbId,
+            type: title.type,
+            season: activeSeason?.number,
+            episode: activeEpisode?.number,
+            titleName: title.name,
+          },
+          initialTime: latestSecondsRef.current ?? 0,
+        },
+      });
+      const cleanCode = res.code.trim().toUpperCase();
+      setPartyCode(cleanCode);
+      void navigate({
+        to: "/watch/$id",
+        params: { id },
+        search: {
+          s: activeSeason?.number,
+          e: activeEpisode?.number,
+          party: cleanCode,
+        },
+        replace: true,
+      });
+    } catch (err) {
+      console.error("Failed to create watch party:", err);
+    }
+  };
+
+  const handleJoinParty = (code: string) => {
+    const cleanCode = code.trim().toUpperCase();
+    setPartyCode(cleanCode);
+    void navigate({
+      to: "/watch/$id",
+      params: { id },
+      search: {
+        s: activeSeason?.number,
+        e: activeEpisode?.number,
+        party: cleanCode,
+      },
+      replace: true,
+    });
+  };
+
+  const handleLeaveParty = () => {
+    try {
+      sessionStorage.removeItem("cinemagic_watch_party");
+    } catch {}
+    party.leaveParty();
+    setPartyCode(null);
+    void navigate({
+      to: "/watch/$id",
+      params: { id },
+      search: {
+        s: activeSeason?.number,
+        e: activeEpisode?.number,
+        party: undefined,
+      },
+      replace: true,
+    });
+  };
+
+  const startSecond = vixsrcStartAt ?? marker ?? undefined;
   const resumeEmbedUrl =
     embedUrl && title?.tmdbId
       ? buildEmbedUrl(player, {
@@ -169,7 +427,7 @@ function WatchPage() {
           type: title.type,
           season: activeSeason?.number,
           episode: activeEpisode?.number,
-          startAt: marker ?? undefined,
+          startAt: startSecond,
         })
       : null;
 
@@ -231,8 +489,6 @@ function WatchPage() {
   }, [title, playlistUrl, embedUrl, slug, season, episode]);
 
   // Debounced persistence of the current playback position.
-  // Flush a pending write when leaving this title or episode so the marker is
-  // stored under the same context that produced it.
   useEffect(() => {
     return () => {
       const seconds = latestSecondsRef.current;
@@ -277,8 +533,6 @@ function WatchPage() {
               : entry,
           ) ?? null,
       );
-      // Persist to localStorage as a cross-session fallback so the resume
-      // marker survives even when the streaming service is unreachable.
       try {
         const key = `watch-marker:${slug}:${season}:${episode}`;
         localStorage.setItem(key, String(clamped));
@@ -328,12 +582,17 @@ function WatchPage() {
         } else {
           const lower = trimmed.toLowerCase();
           if (lower === "pause" || lower === "seeking" || lower === "seek") {
+            setIsLocalPlaying(false);
             if (latestSecondsRef.current !== null) {
               persistMarker(latestSecondsRef.current, true);
+              if (!party.isRemoteSyncingRef.current && party.room) {
+                party.sendPause(latestSecondsRef.current);
+              }
             }
             return;
           }
           if (lower === "ended" || lower === "finish" || lower === "complete") {
+            setIsLocalPlaying(false);
             clearCompletedMarker();
             persistMarker(0, true);
             return;
@@ -352,8 +611,6 @@ function WatchPage() {
       if (!data || typeof data !== "object") return;
       const record = data as PlayerMessagePayload;
 
-      // Vixsrc sends { type: "PLAYER_EVENT", event: { event: "timeupdate"|"seeked"|"play"|"pause"|"ended", currentTime: ..., duration: ... } }
-      // Some versions send { type: "PLAYER_EVENT", data: { event: "...", currentTime: ..., duration: ... } }
       let eventName = "";
       let seconds: number | null = null;
       let totalDuration: number | null = null;
@@ -420,6 +677,7 @@ function WatchPage() {
 
       // Handle video completion
       if (eventName === "ended" || eventName === "complete" || eventName === "finish") {
+        setIsLocalPlaying(false);
         clearCompletedMarker();
         persistMarker(0, true);
         return;
@@ -427,6 +685,7 @@ function WatchPage() {
 
       const durationLimit = totalDuration || playbackDurationSeconds;
       if (seconds !== null && durationLimit > 0 && seconds >= durationLimit - 10) {
+        setIsLocalPlaying(false);
         clearCompletedMarker();
         persistMarker(0, true);
         return;
@@ -436,24 +695,42 @@ function WatchPage() {
       if (eventName === "seeked" || eventName === "seek") {
         if (seconds !== null && Number.isFinite(seconds) && seconds >= 0) {
           persistMarker(seconds, true);
+          if (!party.isRemoteSyncingRef.current && party.room) {
+            party.sendSeek(seconds);
+          }
         }
         return;
       }
 
       // Handle pause events
       if (eventName === "pause") {
+        setIsLocalPlaying(false);
         if (seconds !== null && Number.isFinite(seconds) && seconds >= 0) {
           persistMarker(seconds, true);
+          if (!party.isRemoteSyncingRef.current && party.room) {
+            party.sendPause(seconds);
+          }
         } else if (latestSecondsRef.current !== null) {
           persistMarker(latestSecondsRef.current, true);
+          if (!party.isRemoteSyncingRef.current && party.room) {
+            party.sendPause(latestSecondsRef.current);
+          }
         }
         return;
       }
 
       // Handle play events
       if (eventName === "play" || eventName === "playing" || eventName === "start") {
+        setIsLocalPlaying(true);
         if (seconds !== null && Number.isFinite(seconds) && seconds >= 0) {
           latestSecondsRef.current = seconds;
+          if (!party.isRemoteSyncingRef.current && party.room) {
+            party.sendPlay(seconds);
+          }
+        } else if (latestSecondsRef.current !== null) {
+          if (!party.isRemoteSyncingRef.current && party.room) {
+            party.sendPlay(latestSecondsRef.current);
+          }
         }
         return;
       }
@@ -475,7 +752,7 @@ function WatchPage() {
     window.addEventListener("message", handlePlayerMessage);
     return () => window.removeEventListener("message", handlePlayerMessage);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [markerLoaded, slug, title, season, episode]);
+  }, [markerLoaded, slug, title, season, episode, party]);
 
   if (!title) return null;
 
@@ -483,32 +760,97 @@ function WatchPage() {
 
   return (
     <div className="space-y-6">
-      <div className="min-w-0 space-y-1">
-        <Link
-          to="/title/$id"
-          params={{ id }}
-          className="inline-flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
-        >
-          <ArrowLeft className="size-3.5" />
-          {t("watch_backToDetails")}
-        </Link>
-        <h1 className="truncate font-display text-2xl font-semibold text-foreground">
-          {title.name}
-        </h1>
-        {activeSeason && activeEpisode ? (
-          <p className="text-sm text-muted-foreground">
-            S{activeSeason.number} - E{activeEpisode.number} - {activeEpisode.name}
-          </p>
-        ) : null}
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0 space-y-1">
+          <Link
+            to="/title/$id"
+            params={{ id }}
+            className="inline-flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
+          >
+            <ArrowLeft className="size-3.5" />
+            {t("watch_backToDetails")}
+          </Link>
+          <h1 className="truncate font-display text-2xl font-semibold text-foreground">
+            {title.name}
+          </h1>
+          {activeSeason && activeEpisode ? (
+            <p className="text-sm text-muted-foreground">
+              S{activeSeason.number} - E{activeEpisode.number} - {activeEpisode.name}
+            </p>
+          ) : null}
+        </div>
+
+        <div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setPartyDialogOpen(true)}
+            className={`gap-2 text-xs transition-colors ${
+              party.room
+                ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20"
+                : ""
+            }`}
+          >
+            <Users className="size-3.5" />
+            {party.room ? (
+              <span className="flex items-center gap-1.5">
+                <span className="relative flex size-2">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75"></span>
+                  <span className="relative inline-flex size-2 rounded-full bg-emerald-500"></span>
+                </span>
+                <span>
+                  {t("party_inParty")} ({party.members.length})
+                </span>
+              </span>
+            ) : (
+              <span>{t("party_title")}</span>
+            )}
+          </Button>
+        </div>
       </div>
+
+      <WatchTogetherDialog
+        open={partyDialogOpen}
+        onOpenChange={setPartyDialogOpen}
+        room={party.room}
+        members={party.members}
+        currentAccountId={party.currentAccountId}
+        isHost={party.isHost}
+        isConnected={party.isConnected}
+        isConnecting={party.isConnecting}
+        error={party.error}
+        chatMessages={party.chatMessages}
+        onCreateParty={handleCreateParty}
+        onJoinParty={handleJoinParty}
+        onLeaveParty={handleLeaveParty}
+        onSendChat={party.sendChat}
+      />
 
       {playlistUrl && !hlsFailed ? (
         <div className="aspect-video w-full overflow-hidden rounded-xl border border-border bg-black">
           <HlsPlayer
+            ref={hlsPlayerRef}
             src={playlistUrl}
             title={`${title.name} player`}
             onFatal={() => setHlsFailed(true)}
             onTimeUpdate={(seconds) => persistMarker(seconds)}
+            onPlay={(sec) => {
+              setIsLocalPlaying(true);
+              if (!party.isRemoteSyncingRef.current && party.room) {
+                party.sendPlay(sec);
+              }
+            }}
+            onPause={(sec) => {
+              setIsLocalPlaying(false);
+              if (!party.isRemoteSyncingRef.current && party.room) {
+                party.sendPause(sec);
+              }
+            }}
+            onSeek={(sec) => {
+              if (!party.isRemoteSyncingRef.current && party.room) {
+                party.sendSeek(sec);
+              }
+            }}
             initialSeconds={marker ?? undefined}
           />
         </div>
@@ -524,6 +866,7 @@ function WatchPage() {
           {adBlockPrompt.shouldShow ? <AdBlockPrompt browser={adBlockPrompt.info.browser} /> : null}
           <div className="aspect-video w-full overflow-hidden rounded-xl border border-border bg-black">
             <iframe
+              ref={iframeRef}
               src={resumeEmbedUrl ?? embedUrl}
               title={`${title.name} player`}
               className="size-full"
@@ -549,7 +892,7 @@ function WatchPage() {
                 key={sn.number}
                 to="/watch/$id"
                 params={{ id }}
-                search={{ s: sn.number, e: undefined }}
+                search={{ s: sn.number, e: undefined, party: partyCode ?? undefined }}
                 className={`rounded-full border px-4 py-1.5 text-xs font-medium transition-colors ${
                   sn.number === activeSeason.number
                     ? "border-primary bg-primary text-primary-foreground"
@@ -566,7 +909,7 @@ function WatchPage() {
                 key={ep.id}
                 to="/watch/$id"
                 params={{ id }}
-                search={{ s: activeSeason.number, e: ep.number }}
+                search={{ s: activeSeason.number, e: ep.number, party: partyCode ?? undefined }}
                 className={`flex items-center gap-3 rounded-lg border p-3 transition-colors ${
                   ep.number === activeEpisode?.number
                     ? "border-primary bg-primary/10"

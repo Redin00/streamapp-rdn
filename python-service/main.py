@@ -54,7 +54,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import requests
-from fastapi import Depends, FastAPI, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Response, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
@@ -64,6 +64,7 @@ from auth import bootstrap_admin, require_admin
 from auth import router as auth_router
 from db import get_setting, init_db, set_setting
 from library import router as library_router
+from watch_party import router as party_router, handle_party_websocket
 
 # --------------------------------------------------------------------------- #
 # Logging
@@ -395,6 +396,12 @@ app.add_middleware(
 )
 app.include_router(auth_router)
 app.include_router(library_router)
+app.include_router(party_router)
+
+
+@app.websocket("/ws/party/{code}")
+async def party_ws_route(websocket: WebSocket, code: str, token: Optional[str] = Query(None)):
+    await handle_party_websocket(websocket, code, token)
 
 # Serve uploaded profile pictures under the /profile-pictures path.
 app.mount(
