@@ -871,7 +871,7 @@ function WatchPage() {
               title={`${title.name} player`}
               className="size-full"
               allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
-              referrerPolicy="no-referrer"
+              referrerPolicy="origin"
             />
           </div>
         </div>
