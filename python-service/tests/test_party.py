@@ -147,6 +147,28 @@ class TestWatchParty(unittest.TestCase):
                 self.assertEqual(chat_event["text"], "Bella scena!")
                 self.assertEqual(chat_event["sender"]["name"], "PartyTestUser2")
 
+    def test_websocket_cookie_authentication(self):
+        # 1. Create a party room first
+        payload = {
+            "media": {
+                "slug": "cookie-test",
+                "tmdbId": 123,
+                "type": "movie",
+                "titleName": "Cookie Movie",
+            },
+            "initialTime": 0.0,
+        }
+        create_res = self.client.post("/party/create", json=payload, headers=self.headers)
+        self.assertEqual(create_res.status_code, 200)
+        code = create_res.json()["code"]
+
+        # 2. Connect via WebSocket with cookie instead of query parameter
+        with self.client.websocket_connect(f"/ws/party/{code}", cookies={"streamapp_session": self.token}) as ws:
+            init_msg = ws.receive_json()
+            self.assertEqual(init_msg["type"], "ROOM_STATE")
+            self.assertEqual(init_msg["yourAccountId"], self.account_id)
+            self.assertEqual(init_msg["data"]["code"], code)
+
     def test_websocket_unauthenticated_rejected(self):
         # Connecting without token or with invalid token returns ERROR message
         with self.client.websocket_connect("/ws/party/ROOM-123?token=invalid_token") as ws:

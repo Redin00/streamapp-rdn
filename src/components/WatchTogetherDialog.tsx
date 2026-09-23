@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Check, Copy, Crown, LogOut, Radio, Send, Users } from "lucide-react";
+import { Check, Copy, Crown, Loader2, LogOut, Radio, Send, Users } from "lucide-react";
 
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
@@ -25,6 +25,7 @@ interface WatchTogetherDialogProps {
   isHost: boolean;
   isConnected: boolean;
   isConnecting: boolean;
+  isCreating?: boolean;
   error: string | null;
   chatMessages: ChatMessage[];
   onCreateParty: () => void;
@@ -42,6 +43,7 @@ export function WatchTogetherDialog({
   isHost,
   isConnected,
   isConnecting,
+  isCreating = false,
   error,
   chatMessages,
   onCreateParty,
@@ -271,12 +273,16 @@ export function WatchTogetherDialog({
             <div className="space-y-2">
               <Button
                 onClick={onCreateParty}
-                disabled={isConnecting}
+                disabled={isCreating}
                 className="w-full gap-2 font-medium"
                 size="lg"
               >
-                <Radio className="size-4" />
-                {isConnecting ? t("party_syncing") : t("party_start")}
+                {isCreating ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <Radio className="size-4" />
+                )}
+                {isCreating ? t("party_syncing") : t("party_start")}
               </Button>
             </div>
 
@@ -299,9 +305,14 @@ export function WatchTogetherDialog({
                     placeholder="e.g. CINE-42"
                     className="font-mono uppercase tracking-wider"
                     maxLength={10}
+                    disabled={isConnecting || isCreating}
                   />
-                  <Button type="submit" disabled={!inputCode.trim() || isConnecting}>
-                    {t("party_join")}
+                  <Button type="submit" disabled={!inputCode.trim() || isConnecting || isCreating}>
+                    {isConnecting ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      t("party_join")
+                    )}
                   </Button>
                 </div>
               </div>

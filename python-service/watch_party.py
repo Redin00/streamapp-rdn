@@ -242,14 +242,19 @@ async def handle_party_websocket(websocket: WebSocket, code: str, token: Optiona
     """Handles real-time synchronization between participants in a watch party."""
     await websocket.accept()
 
-    # 1. Authenticate user from query param or initial AUTH message
+    # 1. Authenticate user from query param, cookies, or initial AUTH message
     account = None
     if token:
         account = get_account_from_token(token)
 
     if not account:
+        cookie_token = websocket.cookies.get("streamapp_session")
+        if cookie_token:
+            account = get_account_from_token(cookie_token)
+
+    if not account:
         try:
-            raw = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
+            raw = await asyncio.wait_for(websocket.receive_text(), timeout=1.5)
             msg = json.loads(raw)
             if msg.get("type") == "AUTH" and msg.get("token"):
                 account = get_account_from_token(msg["token"])

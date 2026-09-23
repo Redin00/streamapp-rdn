@@ -9,6 +9,7 @@ interface UseWatchPartyOptions {
   onRemotePause?: (time: number) => void;
   onRemoteSeek?: (time: number) => void;
   onRemoteMediaChange?: (media: PartyMedia, roomCode?: string) => void;
+  onRoomNotFound?: () => void;
   getCurrentTime?: () => number;
   getIsPlaying?: () => boolean;
 }
@@ -19,6 +20,7 @@ export function useWatchParty({
   onRemotePause,
   onRemoteSeek,
   onRemoteMediaChange,
+  onRoomNotFound,
   getCurrentTime,
   getIsPlaying,
 }: UseWatchPartyOptions) {
@@ -32,6 +34,7 @@ export function useWatchParty({
 
   const wsRef = useRef<WebSocket | null>(null);
   const isRemoteSyncingRef = useRef(false);
+  const isDeadRoomRef = useRef(false);
   const syncTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Store latest callbacks in refs so changing parent handlers never triggers reconnect
@@ -39,6 +42,7 @@ export function useWatchParty({
   const onRemotePauseRef = useRef(onRemotePause);
   const onRemoteSeekRef = useRef(onRemoteSeek);
   const onRemoteMediaChangeRef = useRef(onRemoteMediaChange);
+  const onRoomNotFoundRef = useRef(onRoomNotFound);
   const getCurrentTimeRef = useRef(getCurrentTime);
   const getIsPlayingRef = useRef(getIsPlaying);
 
@@ -47,6 +51,7 @@ export function useWatchParty({
     onRemotePauseRef.current = onRemotePause;
     onRemoteSeekRef.current = onRemoteSeek;
     onRemoteMediaChangeRef.current = onRemoteMediaChange;
+    onRoomNotFoundRef.current = onRoomNotFound;
     getCurrentTimeRef.current = getCurrentTime;
     getIsPlayingRef.current = getIsPlaying;
   });
@@ -128,27 +133,29 @@ export function useWatchParty({
 
     let active = true;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    isDeadRoomRef.current = false;
     setIsConnecting(true);
     setError(null);
 
     async function initWs() {
       try {
-        const token = await getPartyToken();
-        if (!active) return;
-        if (!token) {
-          setError("Devi effettuare l'accesso per unirti al Watch Party");
-          setIsConnecting(false);
-          return;
+        let token: string | null = null;
+        try {
+          token = await getPartyToken();
+        } catch {
+          // Ignore, fallback to cookie authentication
         }
+        if (!active || isDeadRoomRef.current) return;
 
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const wsUrl = `${protocol}//${window.location.host}/ws/party/${encodeURIComponent(roomCode!.trim().toUpperCase())}?token=${encodeURIComponent(token)}`;
+        const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : "";
+        const wsUrl = `${protocol}//${window.location.host}/ws/party/${encodeURIComponent(roomCode!.trim().toUpperCase())}${tokenQuery}`;
 
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
 
         ws.onopen = () => {
-          if (!active) {
+          if (!active || isDeadRoomRef.current) {
             ws.close(1000);
             return;
           }
@@ -158,7 +165,7 @@ export function useWatchParty({
         };
 
         ws.onmessage = (event) => {
-          if (!active) return;
+          if (!active || isDeadRoomRef.current) return;
           try {
             const data: PartyEvent = JSON.parse(event.data);
             handlePartyEvent(data);
@@ -178,6 +185,9 @@ export function useWatchParty({
           if (!active) return;
           setIsConnected(false);
           setIsConnecting(false);
+          if (isDeadRoomRef.current) {
+            return;
+          }
           if (event.code === 1008) {
             setError("Autenticazione richiesta o fallita");
           } else if (event.code === 1000) {
@@ -185,14 +195,14 @@ export function useWatchParty({
           } else {
             // Transient closure - try to reconnect if still active
             reconnectTimer = setTimeout(() => {
-              if (active) {
+              if (active && !isDeadRoomRef.current) {
                 initWs();
               }
             }, 2500);
           }
         };
       } catch (err) {
-        if (active) {
+        if (active && !isDeadRoomRef.current) {
           setIsConnecting(false);
           setError("Impossibile connettersi al server del Watch Party");
         }
@@ -310,6 +320,25 @@ export function useWatchParty({
         }
         case "ERROR": {
           setError(msg.message);
+          setIsConnecting(false);
+          const lower = (msg.message || "").toLowerCase();
+          if (
+            lower.includes("not found") ||
+            lower.includes("non trovat") ||
+            lower.includes("scadut")
+          ) {
+            isDeadRoomRef.current = true;
+            if (reconnectTimer) {
+              clearTimeout(reconnectTimer);
+              reconnectTimer = null;
+            }
+            try {
+              sessionStorage.removeItem("cinemagic_watch_party");
+            } catch {}
+            if (onRoomNotFoundRef.current) {
+              onRoomNotFoundRef.current();
+            }
+          }
           break;
         }
       }
@@ -346,6 +375,7 @@ export function useWatchParty({
   }, [isConnected, isHost, room, sendSyncTick]);
 
   const leaveParty = useCallback(() => {
+    isDeadRoomRef.current = true;
     if (wsRef.current) {
       wsRef.current.close(1000);
       wsRef.current = null;

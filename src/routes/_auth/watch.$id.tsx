@@ -195,19 +195,12 @@ function WatchPage() {
     );
   }
 
-  // Check search param first, then fallback to sessionStorage
+  // Check search param first
   const [partyCode, setPartyCode] = useState<string | null>(() => {
     if (searchPartyCode) return searchPartyCode.trim().toUpperCase();
-    if (typeof window !== "undefined") {
-      try {
-        const stored = sessionStorage.getItem("cinemagic_watch_party");
-        if (stored) return stored.trim().toUpperCase();
-      } catch {
-        // Ignore
-      }
-    }
     return null;
   });
+  const [isCreatingParty, setIsCreatingParty] = useState(false);
   const [partyDialogOpen, setPartyDialogOpen] = useState(Boolean(searchPartyCode));
   const [isLocalPlaying, setIsLocalPlaying] = useState(false);
   const [vixsrcStartAt, setVixsrcStartAt] = useState<number | null>(null);
@@ -324,12 +317,30 @@ function WatchPage() {
     return isLocalPlaying;
   }, [playlistUrl, hlsFailed, isLocalPlaying]);
 
+  const onRoomNotFound = useCallback(() => {
+    setPartyCode(null);
+    try {
+      sessionStorage.removeItem("cinemagic_watch_party");
+    } catch {}
+    void navigate({
+      to: "/watch/$id",
+      params: { id },
+      search: {
+        s: activeSeason?.number,
+        e: activeEpisode?.number,
+        party: undefined,
+      },
+      replace: true,
+    });
+  }, [id, activeSeason?.number, activeEpisode?.number, navigate]);
+
   const party = useWatchParty({
     roomCode: partyCode,
     onRemotePlay,
     onRemotePause,
     onRemoteSeek,
     onRemoteMediaChange,
+    onRoomNotFound,
     getCurrentTime,
     getIsPlaying,
   });
@@ -354,7 +365,8 @@ function WatchPage() {
   }, [party.isHost, party.room, party.sendChangeMedia, slug, season, episode, title, activeSeason, activeEpisode]);
 
   const handleCreateParty = async () => {
-    if (!title) return;
+    if (!title || isCreatingParty) return;
+    setIsCreatingParty(true);
     try {
       const res = await createPartyRoom({
         data: {
@@ -371,6 +383,9 @@ function WatchPage() {
       });
       const cleanCode = res.code.trim().toUpperCase();
       setPartyCode(cleanCode);
+      try {
+        sessionStorage.setItem("cinemagic_watch_party", cleanCode);
+      } catch {}
       void navigate({
         to: "/watch/$id",
         params: { id },
@@ -383,6 +398,8 @@ function WatchPage() {
       });
     } catch (err) {
       console.error("Failed to create watch party:", err);
+    } finally {
+      setIsCreatingParty(false);
     }
   };
 
@@ -818,6 +835,7 @@ function WatchPage() {
         isHost={party.isHost}
         isConnected={party.isConnected}
         isConnecting={party.isConnecting}
+        isCreating={isCreatingParty}
         error={party.error}
         chatMessages={party.chatMessages}
         onCreateParty={handleCreateParty}
