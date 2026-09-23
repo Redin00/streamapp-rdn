@@ -400,8 +400,24 @@ app.include_router(party_router)
 
 
 @app.websocket("/ws/party/{code}")
-async def party_ws_route(websocket: WebSocket, code: str, token: Optional[str] = Query(None)):
-    await handle_party_websocket(websocket, code, token)
+async def party_ws_route(
+    websocket: WebSocket,
+    code: str,
+    token: Optional[str] = Query(None),
+    guest_id: Optional[str] = Query(None),
+    guest_name: Optional[str] = Query(None),
+    guest_color: Optional[str] = Query(None),
+    guest_avatar: Optional[str] = Query(None),
+):
+    await handle_party_websocket(
+        websocket,
+        code,
+        token,
+        guest_id=guest_id,
+        guest_name=guest_name,
+        guest_color=guest_color,
+        guest_avatar=guest_avatar,
+    )
 
 # Serve uploaded profile pictures under the /profile-pictures path.
 app.mount(

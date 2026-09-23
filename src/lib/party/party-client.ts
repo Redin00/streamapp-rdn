@@ -8,9 +8,32 @@ import {
 } from "./party.functions";
 import type { ChatMessage, PartyEvent, PartyMedia, PartyMember, WatchPartyRoom } from "./types";
 
+export interface PartyViewerInfo {
+  id: number;
+  name: string;
+  color: string;
+  profilePicture?: string | null | undefined;
+}
+
+export const roomStateCache = new Map<string, WatchPartyRoom>();
+
+export function getOrCreateGuestId(): string {
+  try {
+    const key = "cinemagic_guest_id";
+    const existing = sessionStorage.getItem(key);
+    if (existing) return existing;
+    const generated = `guest-${Math.random().toString(36).substring(2, 9)}`;
+    sessionStorage.setItem(key, generated);
+    return generated;
+  } catch {
+    return `guest-${Date.now()}`;
+  }
+}
+
 interface UseWatchPartyOptions {
   roomCode: string | null;
   initialRoom?: WatchPartyRoom | null;
+  viewer?: PartyViewerInfo | null;
   onRemotePlay?: (time: number) => void;
   onRemotePause?: (time: number) => void;
   onRemoteSeek?: (time: number) => void;
@@ -23,6 +46,7 @@ interface UseWatchPartyOptions {
 export function useWatchParty({
   roomCode,
   initialRoom,
+  viewer,
   onRemotePlay,
   onRemotePause,
   onRemoteSeek,
@@ -31,13 +55,35 @@ export function useWatchParty({
   getCurrentTime,
   getIsPlaying,
 }: UseWatchPartyOptions) {
-  const [room, setRoom] = useState<WatchPartyRoom | null>(initialRoom ?? null);
-  const [members, setMembers] = useState<PartyMember[]>(initialRoom?.members ?? []);
-  const [currentAccountId, setCurrentAccountId] = useState<number | null>(null);
+  const cleanCode = roomCode ? roomCode.trim().toUpperCase() : null;
+  const cachedRoom = cleanCode ? roomStateCache.get(cleanCode) : undefined;
+  const startingRoom = initialRoom ?? cachedRoom ?? null;
+
+  const [room, setRoomState] = useState<WatchPartyRoom | null>(startingRoom);
+  const [members, setMembers] = useState<PartyMember[]>(startingRoom?.members ?? []);
+  const [currentAccountId, setCurrentAccountId] = useState<number | null>(() => viewer?.id ?? null);
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(initialRoom?.chatHistory ?? []);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(startingRoom?.chatHistory ?? []);
+
+  const setRoom = useCallback(
+    (
+      action:
+        | WatchPartyRoom
+        | null
+        | ((prev: WatchPartyRoom | null) => WatchPartyRoom | null),
+    ) => {
+      setRoomState((prev) => {
+        const next = typeof action === "function" ? action(prev) : action;
+        if (next && next.code) {
+          roomStateCache.set(next.code.trim().toUpperCase(), next);
+        }
+        return next;
+      });
+    },
+    [],
+  );
 
   const wsRef = useRef<WebSocket | null>(null);
   const wsConnectedRef = useRef(false);
@@ -51,7 +97,7 @@ export function useWatchParty({
   const currentAccountIdRef = useRef<number | null>(null);
   currentAccountIdRef.current = currentAccountId;
 
-  const lastEventTsRef = useRef<number>(initialRoom?.createdAt ?? Date.now() - 5000);
+  const lastEventTsRef = useRef<number>(startingRoom?.createdAt ?? Date.now() - 5000);
 
   // Sync initialRoom when passed or updated from caller
   useEffect(() => {
@@ -62,7 +108,7 @@ export function useWatchParty({
         setChatMessages(initialRoom.chatHistory);
       }
     }
-  }, [initialRoom, roomCode]);
+  }, [initialRoom, roomCode, setRoom]);
 
   // Store latest callbacks in refs so changing parent handlers never triggers reconnect
   const onRemotePlayRef = useRef(onRemotePlay);
@@ -113,6 +159,10 @@ export function useWatchParty({
             data: {
               code: roomCode.trim().toUpperCase(),
               event,
+              guestId: getOrCreateGuestId(),
+              guestName: viewer?.name,
+              guestColor: viewer?.color,
+              guestAvatar: viewer?.profilePicture,
             },
           });
           if (res.ok && res.room) {
@@ -124,31 +174,69 @@ export function useWatchParty({
         }
       }
     },
-    [roomCode],
+    [roomCode, setRoom, viewer],
   );
 
   const sendPlay = useCallback(
     (time: number) => {
       if (isRemoteSyncingRef.current) return;
+      setRoom((prev) =>
+        prev
+          ? {
+              ...prev,
+              state: {
+                ...prev.state,
+                isPlaying: true,
+                time,
+                lastUpdated: Date.now(),
+              },
+            }
+          : null,
+      );
       void sendEvent({ type: "PLAY", time });
     },
-    [sendEvent],
+    [sendEvent, setRoom],
   );
 
   const sendPause = useCallback(
     (time: number) => {
       if (isRemoteSyncingRef.current) return;
+      setRoom((prev) =>
+        prev
+          ? {
+              ...prev,
+              state: {
+                ...prev.state,
+                isPlaying: false,
+                time,
+                lastUpdated: Date.now(),
+              },
+            }
+          : null,
+      );
       void sendEvent({ type: "PAUSE", time });
     },
-    [sendEvent],
+    [sendEvent, setRoom],
   );
 
   const sendSeek = useCallback(
     (time: number) => {
       if (isRemoteSyncingRef.current) return;
+      setRoom((prev) =>
+        prev
+          ? {
+              ...prev,
+              state: {
+                ...prev.state,
+                time,
+                lastUpdated: Date.now(),
+              },
+            }
+          : null,
+      );
       void sendEvent({ type: "SEEK", time });
     },
-    [sendEvent],
+    [sendEvent, setRoom],
   );
 
   const sendSyncTick = useCallback(
@@ -173,16 +261,16 @@ export function useWatchParty({
         void sendEvent({ type: "CHAT", text: trimmed });
       } else if (roomCode) {
         // Optimistically display chat message immediately for instant feedback
-        const myId = currentAccountIdRef.current ?? 0;
+        const myId = currentAccountIdRef.current ?? viewer?.id ?? 0;
         const myMember = members.find((m) => m.id === myId);
         const optimisticMsg: ChatMessage = {
           id: `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
           text: trimmed,
           sender: {
             id: myId,
-            name: myMember?.name ?? "Tu",
-            color: myMember?.color ?? "#6366f1",
-            profilePicture: myMember?.profilePicture,
+            name: myMember?.name ?? viewer?.name ?? "Tu",
+            color: myMember?.color ?? viewer?.color ?? "#6366f1",
+            profilePicture: myMember?.profilePicture ?? viewer?.profilePicture,
           },
           timestamp: Date.now(),
         };
@@ -190,7 +278,7 @@ export function useWatchParty({
         await sendEvent({ type: "CHAT", text: trimmed });
       }
     },
-    [sendEvent, roomCode, members],
+    [sendEvent, roomCode, members, viewer],
   );
 
   // Connect to the room (Dual-Mode: WebSocket primary + HTTP polling fallback)
@@ -223,14 +311,16 @@ export function useWatchParty({
     isPollingRef.current = false;
     setIsConnecting(true);
     setError(null);
-    lastEventTsRef.current = initialRoom?.createdAt ?? Date.now() - 5000;
+    lastEventTsRef.current = startingRoom?.createdAt ?? Date.now() - 5000;
 
     const cleanCode = roomCode.trim().toUpperCase();
+    const guestId = getOrCreateGuestId();
+    let pollErrorCount = 0;
 
     function startHttpPolling() {
       if (!active || isDeadRoomRef.current || isPollingRef.current) return;
       isPollingRef.current = true;
-      console.info("Watch party: activating HTTP sync fallback for room", cleanCode);
+      console.info("Watch party: starting sync for room", cleanCode);
 
       async function doPoll() {
         if (!active || isDeadRoomRef.current) {
@@ -243,6 +333,10 @@ export function useWatchParty({
             data: {
               code: cleanCode,
               since: lastEventTsRef.current,
+              guestId,
+              guestName: viewer?.name,
+              guestColor: viewer?.color,
+              guestAvatar: viewer?.profilePicture,
             },
           });
 
@@ -252,6 +346,7 @@ export function useWatchParty({
           }
 
           if (res.ok && res.data) {
+            pollErrorCount = 0;
             setIsConnected(true);
             setIsConnecting(false);
             setError(null);
@@ -305,6 +400,7 @@ export function useWatchParty({
               }
             }
           } else if (res.message) {
+            pollErrorCount++;
             const lower = res.message.toLowerCase();
             if (lower.includes("not found") || lower.includes("non trovat") || lower.includes("scadut")) {
               isDeadRoomRef.current = true;
@@ -317,9 +413,16 @@ export function useWatchParty({
               } catch {}
               onRoomNotFoundRef.current?.();
               return;
+            } else if (pollErrorCount >= 3) {
+              setIsConnecting(false);
+              setError(res.message);
             }
           }
         } catch (err) {
+          pollErrorCount++;
+          if (pollErrorCount >= 3) {
+            setIsConnecting(false);
+          }
           console.warn("Watch party HTTP poll error:", err);
         }
 
@@ -352,7 +455,13 @@ export function useWatchParty({
         if (!active || isDeadRoomRef.current) return;
 
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : "";
+        const wsParams = new URLSearchParams();
+        if (token) wsParams.set("token", token);
+        wsParams.set("guest_id", guestId);
+        if (viewer?.name) wsParams.set("guest_name", viewer.name);
+        if (viewer?.color) wsParams.set("guest_color", viewer.color);
+        if (viewer?.profilePicture) wsParams.set("guest_avatar", viewer.profilePicture);
+        const wsQuery = wsParams.toString() ? `?${wsParams.toString()}` : "";
 
         // 1. Determine primary WebSocket host
         let primaryHost = window.location.host;
@@ -363,7 +472,7 @@ export function useWatchParty({
           } catch {}
         }
 
-        const wsUrl = `${protocol}//${primaryHost}/ws/party/${encodeURIComponent(cleanCode)}${tokenQuery}`;
+        const wsUrl = `${protocol}//${primaryHost}/ws/party/${encodeURIComponent(cleanCode)}${wsQuery}`;
 
         let attemptedDirectFallback = false;
 
@@ -381,6 +490,16 @@ export function useWatchParty({
             setIsConnected(true);
             setIsConnecting(false);
             setError(null);
+            try {
+              ws.send(JSON.stringify({
+                type: "AUTH",
+                token: token || undefined,
+                guestId,
+                guestName: viewer?.name,
+                guestColor: viewer?.color,
+                guestAvatar: viewer?.profilePicture,
+              }));
+            } catch {}
           };
 
           ws.onmessage = (event) => {
@@ -403,7 +522,7 @@ export function useWatchParty({
               !scBaseUrl
             ) {
               attemptedDirectFallback = true;
-              const directPortUrl = `${protocol}//${window.location.hostname}:${scPort}/ws/party/${encodeURIComponent(cleanCode)}${tokenQuery}`;
+              const directPortUrl = `${protocol}//${window.location.hostname}:${scPort}/ws/party/${encodeURIComponent(cleanCode)}${wsQuery}`;
               console.info("Trying direct port fallback for Watch Party:", directPortUrl);
               tryConnect(directPortUrl);
               return;
@@ -457,6 +576,9 @@ export function useWatchParty({
         }
       }
     }
+
+    // Start HTTP polling immediately so connection and room state resolve without delay
+    startHttpPolling();
 
     function handlePartyEvent(msg: PartyEvent) {
       switch (msg.type) {
@@ -678,9 +800,12 @@ export function useWatchParty({
       wsRef.current = null;
     }
     if (roomCode) {
+      const clean = roomCode.trim().toUpperCase();
+      roomStateCache.delete(clean);
       void leavePartyRoom({
         data: {
-          code: roomCode.trim().toUpperCase(),
+          code: clean,
+          guestId: getOrCreateGuestId(),
         },
       });
     }

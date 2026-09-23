@@ -52,11 +52,11 @@ def get_account_from_token(token: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def get_party_account(
+def get_party_account_optional(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer),
-) -> Dict[str, Any]:
-    """Authenticate user for Watch Together endpoints via Bearer header or HTTP session cookie."""
+) -> Optional[Dict[str, Any]]:
+    """Try to resolve an authenticated account from Bearer header or HTTP session cookie. Returns None if unauthenticated."""
     if credentials and credentials.scheme.lower() == "bearer" and credentials.credentials:
         acc = get_account_from_token(credentials.credentials)
         if acc:
@@ -66,7 +66,49 @@ def get_party_account(
         acc = get_account_from_token(cookie_token)
         if acc:
             return acc
+    return None
+
+
+def get_party_account(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer),
+) -> Dict[str, Any]:
+    """Authenticate user for Watch Together endpoints via Bearer header or HTTP session cookie."""
+    acc = get_party_account_optional(request, credentials)
+    if acc:
+        return acc
     raise HTTPException(status_code=401, detail="Not signed in")
+
+
+def resolve_party_participant(
+    account: Optional[Dict[str, Any]] = None,
+    guest_id: Optional[str] = None,
+    guest_name: Optional[str] = None,
+    guest_color: Optional[str] = None,
+    guest_avatar: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return the authenticated account or build a stable guest participant."""
+    if account:
+        return account
+
+    gid = (guest_id or "").strip()
+    if not gid:
+        gid = f"guest-{secrets.token_hex(4)}"
+
+    # Deterministic positive integer ID for this guest
+    numeric_id = (abs(hash(gid)) % 900000) + 100000
+    display_name = (guest_name or "").strip() or f"Ospite {str(numeric_id)[-3:]}"
+    color = (guest_color or "").strip() or "#f59e0b"
+    avatar = (guest_avatar or "").strip() or None
+
+    return {
+        "id": numeric_id,
+        "name": display_name,
+        "color": color,
+        "profile_picture": avatar,
+        "profilePicture": avatar,
+        "isGuest": True,
+    }
 
 
 def generate_room_code(length: int = 6) -> str:
@@ -95,6 +137,10 @@ class MediaPayload(BaseModel):
 class CreatePartyRequest(BaseModel):
     media: MediaPayload
     initialTime: float = Field(default=0.0, ge=0.0)
+    guestId: Optional[str] = None
+    guestName: Optional[str] = None
+    guestColor: Optional[str] = None
+    guestAvatar: Optional[str] = None
 
 
 class PartyMemberInfo(BaseModel):
@@ -412,9 +458,16 @@ async def apply_room_event(
 @router.post("/create", response_model=PartyRoomState)
 async def create_party_endpoint(
     body: CreatePartyRequest,
-    account: Dict[str, Any] = Depends(get_party_account),
+    raw_account: Optional[Dict[str, Any]] = Depends(get_party_account_optional),
 ):
     """Create a new Watch Together party room for the specified movie or episode."""
+    account = resolve_party_participant(
+        account=raw_account,
+        guest_id=body.guestId,
+        guest_name=body.guestName,
+        guest_color=body.guestColor,
+        guest_avatar=body.guestAvatar,
+    )
     room = await party_manager.create_room(body.media, account, body.initialTime)
     return room.get_room_state_dict()
 
@@ -433,12 +486,29 @@ async def get_party_endpoint(code: str):
 async def post_party_event_endpoint(
     code: str,
     body: Dict[str, Any],
-    account: Dict[str, Any] = Depends(get_party_account),
+    guest_id: Optional[str] = Query(default=None),
+    guest_name: Optional[str] = Query(default=None),
+    guest_color: Optional[str] = Query(default=None),
+    guest_avatar: Optional[str] = Query(default=None),
+    raw_account: Optional[Dict[str, Any]] = Depends(get_party_account_optional),
 ):
     """Submit an event (PLAY, PAUSE, SEEK, SYNC_TICK, CHANGE_MEDIA, CHAT) via HTTP fallback."""
     room = await party_manager.get_room(code)
     if not room:
         raise HTTPException(status_code=404, detail="Watch party room not found")
+
+    g_id = guest_id or body.get("guestId")
+    g_name = guest_name or body.get("guestName")
+    g_color = guest_color or body.get("guestColor")
+    g_avatar = guest_avatar or body.get("guestAvatar")
+
+    account = resolve_party_participant(
+        account=raw_account,
+        guest_id=g_id,
+        guest_name=g_name,
+        guest_color=g_color,
+        guest_avatar=g_avatar,
+    )
     await room.ensure_member(account)
     event_payload = body.get("event") if isinstance(body.get("event"), dict) else body
     applied = await apply_room_event(room, account, event_payload, exclude_ws_account_id=None)
@@ -446,6 +516,7 @@ async def post_party_event_endpoint(
         "ok": True,
         "room": room.get_room_state_dict(),
         "event": applied,
+        "yourAccountId": account["id"],
         "now": int(time.time() * 1000),
     }
 
@@ -454,12 +525,23 @@ async def post_party_event_endpoint(
 async def poll_party_endpoint(
     code: str,
     since: float = Query(default=0.0),
-    account: Dict[str, Any] = Depends(get_party_account),
+    guest_id: Optional[str] = Query(default=None),
+    guest_name: Optional[str] = Query(default=None),
+    guest_color: Optional[str] = Query(default=None),
+    guest_avatar: Optional[str] = Query(default=None),
+    raw_account: Optional[Dict[str, Any]] = Depends(get_party_account_optional),
 ):
     """Poll for new events and updated room state for HTTP sync clients."""
     room = await party_manager.get_room(code)
     if not room:
         raise HTTPException(status_code=404, detail="Watch party room not found")
+    account = resolve_party_participant(
+        account=raw_account,
+        guest_id=guest_id,
+        guest_name=guest_name,
+        guest_color=guest_color,
+        guest_avatar=guest_avatar,
+    )
     await room.ensure_member(account)
     since_int = int(since)
     new_events = [ev for ev in room.recent_events if ev.get("timestamp", 0) > since_int]
@@ -475,12 +557,14 @@ async def poll_party_endpoint(
 @router.post("/{code}/leave")
 async def leave_party_endpoint(
     code: str,
-    account: Dict[str, Any] = Depends(get_party_account),
+    guest_id: Optional[str] = Query(default=None),
+    raw_account: Optional[Dict[str, Any]] = Depends(get_party_account_optional),
 ):
     """Leave the watch party room."""
     room = await party_manager.get_room(code)
     if not room:
         return {"ok": True}
+    account = resolve_party_participant(account=raw_account, guest_id=guest_id)
     account_id = account["id"]
     async with room.lock:
         room.members.pop(account_id, None)
@@ -515,7 +599,15 @@ async def leave_party_endpoint(
 # WebSocket Endpoint
 # --------------------------------------------------------------------------- #
 
-async def handle_party_websocket(websocket: WebSocket, code: str, token: Optional[str] = None):
+async def handle_party_websocket(
+    websocket: WebSocket,
+    code: str,
+    token: Optional[str] = None,
+    guest_id: Optional[str] = None,
+    guest_name: Optional[str] = None,
+    guest_color: Optional[str] = None,
+    guest_avatar: Optional[str] = None,
+):
     """Handles real-time synchronization between participants in a watch party."""
     await websocket.accept()
 
@@ -531,17 +623,27 @@ async def handle_party_websocket(websocket: WebSocket, code: str, token: Optiona
 
     if not account:
         try:
-            raw = await asyncio.wait_for(websocket.receive_text(), timeout=1.5)
+            raw = await asyncio.wait_for(websocket.receive_text(), timeout=0.8)
             msg = json.loads(raw)
             if msg.get("type") == "AUTH" and msg.get("token"):
                 account = get_account_from_token(msg["token"])
+            elif msg.get("type") == "AUTH":
+                guest_id = guest_id or msg.get("guestId")
+                guest_name = guest_name or msg.get("guestName")
+                guest_color = guest_color or msg.get("guestColor")
+                guest_avatar = guest_avatar or msg.get("guestAvatar")
         except Exception:
             pass
 
+    # If still not authenticated, resolve as participant / guest
     if not account:
-        await websocket.send_text(json.dumps({"type": "ERROR", "message": "Authentication required"}))
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
+        account = resolve_party_participant(
+            account=None,
+            guest_id=guest_id,
+            guest_name=guest_name,
+            guest_color=guest_color,
+            guest_avatar=guest_avatar,
+        )
 
     # 2. Join the room
     clean_code = code.upper().strip()

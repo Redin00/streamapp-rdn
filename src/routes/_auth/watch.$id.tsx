@@ -16,7 +16,7 @@ import {
   recordPlay,
   updateWatchMarker,
 } from "@/lib/library.functions";
-import { useWatchParty } from "@/lib/party/party-client";
+import { getOrCreateGuestId, useWatchParty } from "@/lib/party/party-client";
 import { createPartyRoom, getPartyRoom } from "@/lib/party/party.functions";
 import type { PartyMedia } from "@/lib/party/types";
 import { getPlayerConfig, getStreamSource, getTitle } from "@/lib/streaming.functions";
@@ -151,6 +151,7 @@ export const Route = createFileRoute("/_auth/watch/$id")({
 function WatchPage() {
   const { id } = Route.useParams();
   const { s, e, party: searchPartyCode } = Route.useSearch();
+  const { viewer } = Route.useRouteContext();
   const navigate = Route.useNavigate();
   const queryClient = useQueryClient();
   const { data: title } = useSuspenseQuery(titleQuery(id));
@@ -262,12 +263,12 @@ function WatchPage() {
   const onRemotePlay = useCallback(
     (time: number) => {
       setIsLocalPlaying(true);
+      const cur = latestSecondsRef.current ?? 0;
       latestSecondsRef.current = time;
       if (playlistUrl && !hlsFailed) {
         hlsPlayerRef.current?.seek(time);
         hlsPlayerRef.current?.play();
       } else {
-        const cur = latestSecondsRef.current ?? 0;
         if (Math.abs(cur - time) > 2.5) {
           sendIframePlayerCommand(iframeRef.current, "seek", time);
         }
@@ -368,6 +369,7 @@ function WatchPage() {
 
   const party = useWatchParty({
     roomCode: partyCode,
+    viewer,
     onRemotePlay,
     onRemotePause,
     onRemoteSeek,
@@ -442,6 +444,7 @@ function WatchPage() {
           ? rawTime
           : 0;
 
+      const guestId = getOrCreateGuestId();
       const res = await createPartyRoom({
         data: {
           media: {
@@ -453,6 +456,10 @@ function WatchPage() {
             titleName: title.name,
           },
           initialTime,
+          guestId,
+          guestName: viewer?.name,
+          guestColor: viewer?.color,
+          guestAvatar: viewer?.profilePicture,
         },
       });
 
@@ -498,32 +505,38 @@ function WatchPage() {
     // Fetch room state via REST so UI loads immediately and guest syncs to host's media
     try {
       const res = await getPartyRoom({ data: { code: cleanCode } });
-      if (res.ok && res.room) {
-        party.setRoom(res.room);
-        const targetMedia = res.room.media;
-        if (targetMedia && targetMedia.slug) {
-          const isDiffSlug = targetMedia.slug !== slug;
-          const targetSeason = targetMedia.type === "tv" ? targetMedia.season ?? 1 : undefined;
-          const targetEpisode = targetMedia.type === "tv" ? targetMedia.episode ?? 1 : undefined;
-          const isDiffEp =
-            targetMedia.type === "tv" &&
-            (targetSeason !== activeSeason?.number || targetEpisode !== activeEpisode?.number);
+      if (!res.ok || !res.room) {
+        party.setError(res.message || "Stanza non trovata o scaduta");
+        return;
+      }
 
-          if (isDiffSlug || isDiffEp) {
-            void navigate({
-              to: "/watch/$id",
-              params: { id: targetMedia.slug },
-              search: {
-                s: targetSeason,
-                e: targetEpisode,
-                party: cleanCode,
-              },
-            });
-            return;
-          }
+      party.setRoom(res.room);
+      const targetMedia = res.room.media;
+      if (targetMedia && targetMedia.slug) {
+        const isDiffSlug = targetMedia.slug !== slug;
+        const targetSeason = targetMedia.type === "tv" ? targetMedia.season ?? 1 : undefined;
+        const targetEpisode = targetMedia.type === "tv" ? targetMedia.episode ?? 1 : undefined;
+        const isDiffEp =
+          targetMedia.type === "tv" &&
+          (targetSeason !== activeSeason?.number || targetEpisode !== activeEpisode?.number);
+
+        if (isDiffSlug || isDiffEp) {
+          void navigate({
+            to: "/watch/$id",
+            params: { id: targetMedia.slug },
+            search: {
+              s: targetSeason,
+              e: targetEpisode,
+              party: cleanCode,
+            },
+          });
+          return;
         }
       }
-    } catch {}
+    } catch (err) {
+      party.setError(err instanceof Error ? err.message : "Errore durante la connessione alla stanza");
+      return;
+    }
 
     void navigate({
       to: "/watch/$id",
@@ -704,6 +717,10 @@ function WatchPage() {
     if (!markerLoaded) return;
 
     const handlePlayerMessage = (event: MessageEvent) => {
+      if (iframeRef.current?.contentWindow && event.source && event.source !== iframeRef.current.contentWindow) {
+        return;
+      }
+
       let data = event.data;
 
       // Handle string messages
@@ -717,12 +734,30 @@ function WatchPage() {
           }
         } else {
           const lower = trimmed.toLowerCase();
-          if (lower === "pause" || lower === "seeking" || lower === "seek") {
+          if (lower === "pause") {
             setIsLocalPlaying(false);
             if (latestSecondsRef.current !== null) {
               persistMarker(latestSecondsRef.current, true);
               if (!party.isRemoteSyncingRef.current && party.room) {
                 party.sendPause(latestSecondsRef.current);
+              }
+            }
+            return;
+          }
+          if (lower === "play" || lower === "playing" || lower === "start") {
+            setIsLocalPlaying(true);
+            if (latestSecondsRef.current !== null) {
+              if (!party.isRemoteSyncingRef.current && party.room) {
+                party.sendPlay(latestSecondsRef.current);
+              }
+            }
+            return;
+          }
+          if (lower === "seeking" || lower === "seek" || lower === "seeked") {
+            if (latestSecondsRef.current !== null) {
+              persistMarker(latestSecondsRef.current, true);
+              if (!party.isRemoteSyncingRef.current && party.room) {
+                party.sendSeek(latestSecondsRef.current);
               }
             }
             return;

@@ -309,6 +309,52 @@ class TestWatchParty(unittest.TestCase):
         self.assertEqual(len(room_after["members"]), 1)
         self.assertEqual(room_after["members"][0]["id"], self.account_id)
 
+    def test_guest_unauthenticated_join_and_sync(self):
+        # 1. Host creates a party room
+        payload = {
+            "media": {
+                "slug": "guest-test",
+                "tmdbId": 333,
+                "type": "movie",
+                "titleName": "Guest Test Movie",
+            },
+            "initialTime": 10.0,
+        }
+        res = self.client.post("/party/create", json=payload, headers=self.headers)
+        self.assertEqual(res.status_code, 200)
+        code = res.json()["code"]
+
+        # 2. Guest connects via HTTP poll without ANY auth header or cookie!
+        poll_res = self.client.get(
+            f"/party/{code}/poll?since=0&guest_id=guest-tab-1&guest_name=OspiteTest&guest_color=%2310b981"
+        )
+        self.assertEqual(poll_res.status_code, 200)
+        poll_data = poll_res.json()
+        self.assertTrue(poll_data["ok"])
+        self.assertIn("yourAccountId", poll_data)
+        guest_account_id = poll_data["yourAccountId"]
+        # Member should be registered with guest name
+        guest_member = next((m for m in poll_data["room"]["members"] if m["id"] == guest_account_id), None)
+        self.assertIsNotNone(guest_member)
+        self.assertEqual(guest_member["name"], "OspiteTest")
+
+        # 3. Guest posts an event via HTTP without auth header
+        event_res = self.client.post(
+            f"/party/{code}/event?guest_id=guest-tab-1&guest_name=OspiteTest",
+            json={"event": {"type": "PAUSE", "time": 15.0}},
+        )
+        self.assertEqual(event_res.status_code, 200)
+        self.assertFalse(event_res.json()["room"]["state"]["isPlaying"])
+        self.assertEqual(event_res.json()["room"]["state"]["time"], 15.0)
+
+        # 4. Guest connects via WebSocket with guest_id and guest_name without token
+        with self.client.websocket_connect(
+            f"/ws/party/{code}?guest_id=guest-ws-1&guest_name=OspiteWs&guest_color=%23ef4444"
+        ) as ws_guest:
+            init_msg = ws_guest.receive_json()
+            self.assertEqual(init_msg["type"], "ROOM_STATE")
+            self.assertIn("yourAccountId", init_msg)
+
 
 if __name__ == "__main__":
     unittest.main()

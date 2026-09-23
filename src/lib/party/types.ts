@@ -82,3 +82,10 @@ export interface PartyEventResponse {
   now: number;
 }
 
+export interface PartyGuestMetadata {
+  guestId?: string | undefined;
+  guestName?: string | undefined;
+  guestColor?: string | undefined;
+  guestAvatar?: string | null | undefined;
+}
+
