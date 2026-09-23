@@ -145,11 +145,24 @@ export function WatchTogetherDialog({
 
             {/* Status indicator */}
             <div className="flex items-center gap-2 text-xs">
-              <span className="relative flex size-2">
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75"></span>
-                <span className="relative inline-flex size-2 rounded-full bg-emerald-500"></span>
-              </span>
-              <span className="font-medium text-emerald-500">{t("party_connected")}</span>
+              {isConnected ? (
+                <>
+                  <span className="relative flex size-2">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75"></span>
+                    <span className="relative inline-flex size-2 rounded-full bg-emerald-500"></span>
+                  </span>
+                  <span className="font-medium text-emerald-500">{t("party_connected")}</span>
+                </>
+              ) : (
+                <>
+                  <span className="relative flex size-2">
+                    <span className="relative inline-flex size-2 rounded-full bg-amber-500"></span>
+                  </span>
+                  <span className="font-medium text-amber-500">
+                    {isConnecting ? t("party_syncing") : "Connessione..."}
+                  </span>
+                </>
+              )}
               <span className="text-muted-foreground">•</span>
               <span className="text-muted-foreground">
                 {isHost ? t("party_host") : "Guest"}

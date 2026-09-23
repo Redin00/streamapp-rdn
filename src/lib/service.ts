@@ -54,7 +54,11 @@ export async function serviceFetch<T>(path: string, init?: RequestInit): Promise
 
   let response: Response;
   try {
-    response = await fetch(`${base.replace(/\/$/, "")}${path}`, { ...init, headers });
+    response = await fetch(`${base.replace(/\/$/, "")}${path}`, {
+      ...init,
+      headers,
+      signal: init?.signal ?? AbortSignal.timeout(10000),
+    });
   } catch {
     throw new ServiceError(0, "Cannot reach the streaming service");
   }

@@ -17,7 +17,7 @@ import {
   updateWatchMarker,
 } from "@/lib/library.functions";
 import { useWatchParty } from "@/lib/party/party-client";
-import { createPartyRoom } from "@/lib/party/party.functions";
+import { createPartyRoom, getPartyRoom } from "@/lib/party/party.functions";
 import type { PartyMedia } from "@/lib/party/types";
 import { getPlayerConfig, getStreamSource, getTitle } from "@/lib/streaming.functions";
 import { buildEmbedUrl } from "@/lib/streaming/player";
@@ -367,21 +367,36 @@ function WatchPage() {
   const handleCreateParty = async () => {
     if (!title || isCreatingParty) return;
     setIsCreatingParty(true);
+    party.setError(null);
     try {
+      const rawTime = latestSecondsRef.current;
+      const initialTime =
+        typeof rawTime === "number" && Number.isFinite(rawTime) && rawTime >= 0
+          ? rawTime
+          : 0;
+
       const res = await createPartyRoom({
         data: {
           media: {
             slug,
-            tmdbId: title.tmdbId,
-            type: title.type,
-            season: activeSeason?.number,
-            episode: activeEpisode?.number,
+            tmdbId: title.tmdbId ?? null,
+            type: title.type === "tv" ? "tv" : "movie",
+            season: activeSeason?.number ?? null,
+            episode: activeEpisode?.number ?? null,
             titleName: title.name,
           },
-          initialTime: latestSecondsRef.current ?? 0,
+          initialTime,
         },
       });
-      const cleanCode = res.code.trim().toUpperCase();
+
+      if (!res.ok || !res.room) {
+        party.setError(res.message || "Impossibile creare la stanza");
+        return;
+      }
+
+      // Immediately set the room so UI transitions to the active room view without delay
+      party.setRoom(res.room);
+      const cleanCode = res.room.code.trim().toUpperCase();
       setPartyCode(cleanCode);
       try {
         sessionStorage.setItem("cinemagic_watch_party", cleanCode);
@@ -398,14 +413,20 @@ function WatchPage() {
       });
     } catch (err) {
       console.error("Failed to create watch party:", err);
+      party.setError(err instanceof Error ? err.message : "Errore durante la creazione della stanza");
     } finally {
       setIsCreatingParty(false);
     }
   };
 
-  const handleJoinParty = (code: string) => {
+  const handleJoinParty = async (code: string) => {
     const cleanCode = code.trim().toUpperCase();
+    if (!cleanCode) return;
+    party.setError(null);
     setPartyCode(cleanCode);
+    try {
+      sessionStorage.setItem("cinemagic_watch_party", cleanCode);
+    } catch {}
     void navigate({
       to: "/watch/$id",
       params: { id },
@@ -416,6 +437,13 @@ function WatchPage() {
       },
       replace: true,
     });
+    // Optimistically fetch the room state via REST so UI loads immediately
+    try {
+      const res = await getPartyRoom({ data: { code: cleanCode } });
+      if (res.ok && res.room) {
+        party.setRoom(res.room);
+      }
+    } catch {}
   };
 
   const handleLeaveParty = () => {

@@ -14,10 +14,11 @@ import string
 import time
 from typing import Any, Dict, List, Optional, Set
 
-from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 
-from auth import current_account, current_session, Session, token_hash
+from auth import bearer, current_account, current_session, Session, token_hash
 from db import connect, now
 
 log = logging.getLogger("streaming-dashboard")
@@ -49,6 +50,23 @@ def get_account_from_token(token: str) -> Optional[Dict[str, Any]]:
     except Exception as exc:
         log.warning("error validating party token: %s", exc)
     return None
+
+
+def get_party_account(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer),
+) -> Dict[str, Any]:
+    """Authenticate user for Watch Together endpoints via Bearer header or HTTP session cookie."""
+    if credentials and credentials.scheme.lower() == "bearer" and credentials.credentials:
+        acc = get_account_from_token(credentials.credentials)
+        if acc:
+            return acc
+    cookie_token = request.cookies.get("streamapp_session")
+    if cookie_token:
+        acc = get_account_from_token(cookie_token)
+        if acc:
+            return acc
+    raise HTTPException(status_code=401, detail="Not signed in")
 
 
 def generate_room_code(length: int = 6) -> str:
@@ -218,7 +236,7 @@ party_manager = PartyManager()
 @router.post("/create", response_model=PartyRoomState)
 async def create_party_endpoint(
     body: CreatePartyRequest,
-    account: Dict[str, Any] = Depends(current_account),
+    account: Dict[str, Any] = Depends(get_party_account),
 ):
     """Create a new Watch Together party room for the specified movie or episode."""
     room = await party_manager.create_room(body.media, account, body.initialTime)

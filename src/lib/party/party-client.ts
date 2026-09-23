@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { getPartyToken } from "./party.functions";
+import { getPartyConnectionInfo } from "./party.functions";
 import type { ChatMessage, PartyEvent, PartyMedia, PartyMember, WatchPartyRoom } from "./types";
 
 interface UseWatchPartyOptions {
   roomCode: string | null;
+  initialRoom?: WatchPartyRoom | null;
   onRemotePlay?: (time: number) => void;
   onRemotePause?: (time: number) => void;
   onRemoteSeek?: (time: number) => void;
@@ -16,6 +17,7 @@ interface UseWatchPartyOptions {
 
 export function useWatchParty({
   roomCode,
+  initialRoom,
   onRemotePlay,
   onRemotePause,
   onRemoteSeek,
@@ -24,18 +26,29 @@ export function useWatchParty({
   getCurrentTime,
   getIsPlaying,
 }: UseWatchPartyOptions) {
-  const [room, setRoom] = useState<WatchPartyRoom | null>(null);
-  const [members, setMembers] = useState<PartyMember[]>([]);
+  const [room, setRoom] = useState<WatchPartyRoom | null>(initialRoom ?? null);
+  const [members, setMembers] = useState<PartyMember[]>(initialRoom?.members ?? []);
   const [currentAccountId, setCurrentAccountId] = useState<number | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(initialRoom?.chatHistory ?? []);
 
   const wsRef = useRef<WebSocket | null>(null);
   const isRemoteSyncingRef = useRef(false);
   const isDeadRoomRef = useRef(false);
   const syncTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Sync initialRoom when passed or updated from caller
+  useEffect(() => {
+    if (initialRoom && initialRoom.code === roomCode) {
+      setRoom(initialRoom);
+      setMembers(initialRoom.members);
+      if (Array.isArray(initialRoom.chatHistory)) {
+        setChatMessages(initialRoom.chatHistory);
+      }
+    }
+  }, [initialRoom, roomCode]);
 
   // Store latest callbacks in refs so changing parent handlers never triggers reconnect
   const onRemotePlayRef = useRef(onRemotePlay);
@@ -140,8 +153,14 @@ export function useWatchParty({
     async function initWs() {
       try {
         let token: string | null = null;
+        let scBaseUrl: string | null = null;
+        let scPort = "8000";
+
         try {
-          token = await getPartyToken();
+          const info = await getPartyConnectionInfo();
+          token = info.token;
+          scBaseUrl = info.scBaseUrl;
+          scPort = info.scPort || "8000";
         } catch {
           // Ignore, fallback to cookie authentication
         }
@@ -149,58 +168,89 @@ export function useWatchParty({
 
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
         const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : "";
-        const wsUrl = `${protocol}//${window.location.host}/ws/party/${encodeURIComponent(roomCode!.trim().toUpperCase())}${tokenQuery}`;
+        const cleanCode = roomCode!.trim().toUpperCase();
 
-        const ws = new WebSocket(wsUrl);
-        wsRef.current = ws;
-
-        ws.onopen = () => {
-          if (!active || isDeadRoomRef.current) {
-            ws.close(1000);
-            return;
-          }
-          setIsConnected(true);
-          setIsConnecting(false);
-          setError(null);
-        };
-
-        ws.onmessage = (event) => {
-          if (!active || isDeadRoomRef.current) return;
+        // 1. Determine primary WebSocket host
+        let primaryHost = window.location.host;
+        if (scBaseUrl) {
           try {
-            const data: PartyEvent = JSON.parse(event.data);
-            handlePartyEvent(data);
-          } catch (e) {
-            console.error("Failed to parse party message:", e);
-          }
-        };
+            const parsed = new URL(scBaseUrl);
+            primaryHost = parsed.host;
+          } catch {}
+        }
 
-        ws.onerror = (err) => {
-          console.error("Watch party WebSocket error:", err);
-          if (active) {
+        const wsUrl = `${protocol}//${primaryHost}/ws/party/${encodeURIComponent(cleanCode)}${tokenQuery}`;
+
+        let attemptedDirectFallback = false;
+
+        function tryConnect(url: string) {
+          if (!active || isDeadRoomRef.current) return;
+          const ws = new WebSocket(url);
+          wsRef.current = ws;
+
+          ws.onopen = () => {
+            if (!active || isDeadRoomRef.current) {
+              ws.close(1000);
+              return;
+            }
+            setIsConnected(true);
             setIsConnecting(false);
-          }
-        };
+            setError(null);
+          };
 
-        ws.onclose = (event) => {
-          if (!active) return;
-          setIsConnected(false);
-          setIsConnecting(false);
-          if (isDeadRoomRef.current) {
-            return;
-          }
-          if (event.code === 1008) {
-            setError("Autenticazione richiesta o fallita");
-          } else if (event.code === 1000) {
-            // Normal close
-          } else {
-            // Transient closure - try to reconnect if still active
-            reconnectTimer = setTimeout(() => {
-              if (active && !isDeadRoomRef.current) {
-                initWs();
-              }
-            }, 2500);
-          }
-        };
+          ws.onmessage = (event) => {
+            if (!active || isDeadRoomRef.current) return;
+            try {
+              const data: PartyEvent = JSON.parse(event.data);
+              handlePartyEvent(data);
+            } catch (e) {
+              console.error("Failed to parse party message:", e);
+            }
+          };
+
+          ws.onerror = (err) => {
+            console.error("Watch party WebSocket error connecting to", url, err);
+            // If primary host on a non-standard port failed without reverse proxy, try direct port fallback
+            if (
+              !attemptedDirectFallback &&
+              window.location.port &&
+              window.location.port !== scPort &&
+              !scBaseUrl
+            ) {
+              attemptedDirectFallback = true;
+              const directPortUrl = `${protocol}//${window.location.hostname}:${scPort}/ws/party/${encodeURIComponent(cleanCode)}${tokenQuery}`;
+              console.info("Trying direct port fallback for Watch Party:", directPortUrl);
+              tryConnect(directPortUrl);
+              return;
+            }
+            if (active) {
+              setIsConnecting(false);
+            }
+          };
+
+          ws.onclose = (event) => {
+            if (!active) return;
+            setIsConnected(false);
+            setIsConnecting(false);
+            if (isDeadRoomRef.current) {
+              return;
+            }
+            if (event.code === 1008) {
+              setError("Autenticazione richiesta o fallita");
+            } else if (event.code === 1000) {
+              // Normal close
+            } else {
+              // Transient closure - try to reconnect if still active
+              reconnectTimer = setTimeout(() => {
+                if (active && !isDeadRoomRef.current) {
+                  initWs();
+                }
+              }, 3000);
+            }
+          };
+        }
+
+        tryConnect(wsUrl);
       } catch (err) {
         if (active && !isDeadRoomRef.current) {
           setIsConnecting(false);
@@ -383,18 +433,21 @@ export function useWatchParty({
     setRoom(null);
     setMembers([]);
     setIsConnected(false);
+    setIsConnecting(false);
     setError(null);
     setChatMessages([]);
   }, []);
 
   return {
     room,
+    setRoom,
     members,
     currentAccountId,
     isHost,
     isConnected,
     isConnecting,
     error,
+    setError,
     chatMessages,
     isRemoteSyncingRef,
     withRemoteSync,

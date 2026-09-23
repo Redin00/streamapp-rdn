@@ -75,6 +75,23 @@ class TestWatchParty(unittest.TestCase):
         self.assertEqual(get_data["code"], code)
         self.assertEqual(get_data["hostId"], self.account_id)
 
+    def test_create_party_cookie_auth(self):
+        # Create party using cookie without Authorization Bearer header
+        payload = {
+            "media": {
+                "slug": "cookie-room",
+                "tmdbId": 1234,
+                "type": "movie",
+                "titleName": "Cookie Room Title",
+            },
+            "initialTime": 0.0,
+        }
+        res = self.client.post("/party/create", json=payload, cookies={"streamapp_session": self.token})
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertIn("code", data)
+        self.assertEqual(data["hostId"], self.account_id)
+
     def test_party_not_found(self):
         res = self.client.get("/party/NONEXISTENT-99")
         self.assertEqual(res.status_code, 404)
