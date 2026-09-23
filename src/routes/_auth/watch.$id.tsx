@@ -239,12 +239,15 @@ function WatchPage() {
   const [vixsrcAutoplay, setVixsrcAutoplay] = useState<boolean | undefined>(undefined);
   // Incremented to force the iframe to fully remount when remote sync requires a reload
   const [vixsrcIframeKey, setVixsrcIframeKey] = useState(0);
+const REMOTE_SUPPRESS_MS = 6000; // ms, covers iframe reload latency and remote action window
 
   const hlsPlayerRef = useRef<HlsPlayerHandle>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const lastBroadcastMediaRef = useRef<string>("");
   // Timestamp of the last remote-triggered iframe reload (ms). Events fired by the
   // newly loaded player within 5 s of this timestamp should not be re-broadcast.
+  // Tracks the last remote‑initiated action to suppress rebroadcast of the iframe's own events
+  const remoteActionRef = useRef<{ type: string | null; ts: number }>({ type: null, ts: 0 });
   const lastRemoteReloadRef = useRef<number>(0);
 
   useEffect(() => {
@@ -270,6 +273,7 @@ function WatchPage() {
   const onRemotePlay = useCallback(
     (time: number) => {
       setIsLocalPlaying(true);
+      remoteActionRef.current = { type: "play", ts: Date.now() };
       latestSecondsRef.current = time;
       if (playlistUrl && !hlsFailed) {
         hlsPlayerRef.current?.seek(time);
@@ -292,6 +296,7 @@ function WatchPage() {
   const onRemotePause = useCallback(
     (time: number) => {
       setIsLocalPlaying(false);
+      remoteActionRef.current = { type: "pause", ts: Date.now() };
       latestSecondsRef.current = time;
       if (playlistUrl && !hlsFailed) {
         hlsPlayerRef.current?.pause();
@@ -320,6 +325,8 @@ function WatchPage() {
       if (playlistUrl && !hlsFailed) {
         hlsPlayerRef.current?.seek(time);
       } else {
+        // Record remote seek action to suppress subsequent broadcast
+        remoteActionRef.current = { type: "seek", ts: Date.now() };
         // Only reload for seeks far from current position to avoid unnecessary reloads.
         // Throttle reloads to once per 4 s to avoid spamming from SYNC_TICK.
         if (Math.abs(cur - time) > 3 && Date.now() - lastRemoteReloadRef.current >= 4000) {
@@ -775,6 +782,7 @@ function WatchPage() {
             return;
           }
         } else {
+          remoteActionRef.current = { type: "seek", ts: Date.now() };
           const lower = trimmed.toLowerCase();
           if (lower === "pause") {
             setIsLocalPlaying(false);
@@ -928,7 +936,8 @@ function WatchPage() {
         persistMarker(curSec, true);
         const suppressBroadcast =
           party.isRemoteSyncingRef.current ||
-          Date.now() - lastRemoteReloadRef.current < 5000;
+          Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS ||
+          (remoteActionRef.current.type === "seek" && Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS);
         if (!suppressBroadcast && party.room) {
           party.sendSeek(curSec);
         }
@@ -943,7 +952,8 @@ function WatchPage() {
         persistMarker(curSec, true);
         const suppressBroadcast =
           party.isRemoteSyncingRef.current ||
-          Date.now() - lastRemoteReloadRef.current < 5000;
+          Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS ||
+          (remoteActionRef.current.type === "pause" && Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS);
         if (!suppressBroadcast && party.room) {
           party.sendPause(curSec);
         }
@@ -957,7 +967,8 @@ function WatchPage() {
         latestSecondsRef.current = curSec;
         const suppressBroadcast =
           party.isRemoteSyncingRef.current ||
-          Date.now() - lastRemoteReloadRef.current < 5000;
+          Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS ||
+          (remoteActionRef.current.type === "play" && Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS);
         if (!suppressBroadcast && party.room) {
           party.sendPlay(curSec);
         }
