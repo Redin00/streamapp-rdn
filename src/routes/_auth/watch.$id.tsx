@@ -235,6 +235,7 @@ function WatchPage() {
   const [isCreatingParty, setIsCreatingParty] = useState(false);
   const [partyDialogOpen, setPartyDialogOpen] = useState(Boolean(searchPartyCode));
   const [isLocalPlaying, setIsLocalPlaying] = useState(false);
+  const [vixsrcStartAt, setVixsrcStartAt] = useState<number | null>(null);
 
   const hlsPlayerRef = useRef<HlsPlayerHandle>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
@@ -269,10 +270,11 @@ function WatchPage() {
         hlsPlayerRef.current?.seek(time);
         hlsPlayerRef.current?.play();
       } else {
-        if (Math.abs(cur - time) > 2.5) {
-          sendIframePlayerCommand(iframeRef.current, "seek", time);
-        }
         sendIframePlayerCommand(iframeRef.current, "play");
+        if (Math.abs(cur - time) > 3) {
+          sendIframePlayerCommand(iframeRef.current, "seek", time);
+          setVixsrcStartAt(Math.floor(time));
+        }
       }
     },
     [playlistUrl, hlsFailed],
@@ -293,11 +295,15 @@ function WatchPage() {
 
   const onRemoteSeek = useCallback(
     (time: number) => {
+      const cur = latestSecondsRef.current ?? 0;
       latestSecondsRef.current = time;
       if (playlistUrl && !hlsFailed) {
         hlsPlayerRef.current?.seek(time);
       } else {
         sendIframePlayerCommand(iframeRef.current, "seek", time);
+        if (Math.abs(cur - time) > 3) {
+          setVixsrcStartAt(Math.floor(time));
+        }
       }
     },
     [playlistUrl, hlsFailed],
@@ -511,6 +517,9 @@ function WatchPage() {
       }
 
       party.setRoom(res.room);
+      if (res.room.state?.time && res.room.state.time > 0) {
+        setVixsrcStartAt(Math.floor(res.room.state.time));
+      }
       const targetMedia = res.room.media;
       if (targetMedia && targetMedia.slug) {
         const isDiffSlug = targetMedia.slug !== slug;
@@ -554,21 +563,21 @@ function WatchPage() {
     try {
       sessionStorage.removeItem("cinemagic_watch_party");
     } catch {}
-    party.leaveParty();
+    void party.leaveParty();
     setPartyCode(null);
+    setPartyDialogOpen(false);
     void navigate({
       to: "/watch/$id",
       params: { id },
-      search: {
-        s: activeSeason?.number,
-        e: activeEpisode?.number,
+      search: (prev) => ({
+        ...prev,
         party: undefined,
-      },
+      }),
       replace: true,
     });
   };
 
-  const startSecond = marker ?? undefined;
+  const startSecond = vixsrcStartAt ?? party.room?.state?.time ?? marker ?? undefined;
   const resumeEmbedUrl =
     embedUrl && title?.tmdbId
       ? buildEmbedUrl(player, {
@@ -717,11 +726,18 @@ function WatchPage() {
     if (!markerLoaded) return;
 
     const handlePlayerMessage = (event: MessageEvent) => {
-      if (iframeRef.current?.contentWindow && event.source && event.source !== iframeRef.current.contentWindow) {
+      let data = event.data;
+      if (!data) return;
+
+      // Ignore React DevTools / webpack / unrelated messages
+      if (
+        typeof data === "object" &&
+        "source" in data &&
+        typeof (data as Record<string, unknown>)["source"] === "string" &&
+        String((data as Record<string, unknown>)["source"]).startsWith("react-devtools")
+      ) {
         return;
       }
-
-      let data = event.data;
 
       // Handle string messages
       if (typeof data === "string") {
@@ -736,29 +752,26 @@ function WatchPage() {
           const lower = trimmed.toLowerCase();
           if (lower === "pause") {
             setIsLocalPlaying(false);
-            if (latestSecondsRef.current !== null) {
-              persistMarker(latestSecondsRef.current, true);
-              if (!party.isRemoteSyncingRef.current && party.room) {
-                party.sendPause(latestSecondsRef.current);
-              }
+            const curSec = latestSecondsRef.current ?? 0;
+            persistMarker(curSec, true);
+            if (!party.isRemoteSyncingRef.current && party.room) {
+              party.sendPause(curSec);
             }
             return;
           }
           if (lower === "play" || lower === "playing" || lower === "start") {
             setIsLocalPlaying(true);
-            if (latestSecondsRef.current !== null) {
-              if (!party.isRemoteSyncingRef.current && party.room) {
-                party.sendPlay(latestSecondsRef.current);
-              }
+            const curSec = latestSecondsRef.current ?? 0;
+            if (!party.isRemoteSyncingRef.current && party.room) {
+              party.sendPlay(curSec);
             }
             return;
           }
           if (lower === "seeking" || lower === "seek" || lower === "seeked") {
-            if (latestSecondsRef.current !== null) {
-              persistMarker(latestSecondsRef.current, true);
-              if (!party.isRemoteSyncingRef.current && party.room) {
-                party.sendSeek(latestSecondsRef.current);
-              }
+            const curSec = latestSecondsRef.current ?? 0;
+            persistMarker(curSec, true);
+            if (!party.isRemoteSyncingRef.current && party.room) {
+              party.sendSeek(curSec);
             }
             return;
           }
@@ -771,6 +784,7 @@ function WatchPage() {
           if (lower.startsWith("time:")) {
             const parsed = parseFloat(lower.slice(5));
             if (Number.isFinite(parsed) && parsed >= 0) {
+              latestSecondsRef.current = parsed;
               persistMarker(parsed, false);
             }
             return;
@@ -812,9 +826,19 @@ function WatchPage() {
         eventName = record.type.toLowerCase();
       }
 
-      // Fallback search for seconds in any payload object
+      // Fallback search for seconds in any payload object (including nested vixsrc data)
       if (seconds === null) {
-        const candidates = [record, record.data, record.event, record.info, record.payload];
+        const evAny = record.event as Record<string, unknown> | undefined;
+        const dataAny = record.data as Record<string, unknown> | undefined;
+        const candidates = [
+          record,
+          dataAny,
+          evAny,
+          evAny && typeof evAny["data"] === "object" ? (evAny["data"] as Record<string, unknown>) : null,
+          dataAny && typeof dataAny["data"] === "object" ? (dataAny["data"] as Record<string, unknown>) : null,
+          record.info,
+          record.payload,
+        ];
         for (const cand of candidates) {
           if (cand && typeof cand === "object") {
             const c = cand as PlayerEventData;
@@ -864,11 +888,11 @@ function WatchPage() {
 
       // Handle seek events (mouse drag/click on progress bar)
       if (eventName === "seeked" || eventName === "seek") {
-        if (seconds !== null && Number.isFinite(seconds) && seconds >= 0) {
-          persistMarker(seconds, true);
-          if (!party.isRemoteSyncingRef.current && party.room) {
-            party.sendSeek(seconds);
-          }
+        const curSec = seconds ?? latestSecondsRef.current ?? 0;
+        latestSecondsRef.current = curSec;
+        persistMarker(curSec, true);
+        if (!party.isRemoteSyncingRef.current && party.room) {
+          party.sendSeek(curSec);
         }
         return;
       }
@@ -876,16 +900,11 @@ function WatchPage() {
       // Handle pause events
       if (eventName === "pause") {
         setIsLocalPlaying(false);
-        if (seconds !== null && Number.isFinite(seconds) && seconds >= 0) {
-          persistMarker(seconds, true);
-          if (!party.isRemoteSyncingRef.current && party.room) {
-            party.sendPause(seconds);
-          }
-        } else if (latestSecondsRef.current !== null) {
-          persistMarker(latestSecondsRef.current, true);
-          if (!party.isRemoteSyncingRef.current && party.room) {
-            party.sendPause(latestSecondsRef.current);
-          }
+        const curSec = seconds ?? latestSecondsRef.current ?? 0;
+        latestSecondsRef.current = curSec;
+        persistMarker(curSec, true);
+        if (!party.isRemoteSyncingRef.current && party.room) {
+          party.sendPause(curSec);
         }
         return;
       }
@@ -893,15 +912,10 @@ function WatchPage() {
       // Handle play events
       if (eventName === "play" || eventName === "playing" || eventName === "start") {
         setIsLocalPlaying(true);
-        if (seconds !== null && Number.isFinite(seconds) && seconds >= 0) {
-          latestSecondsRef.current = seconds;
-          if (!party.isRemoteSyncingRef.current && party.room) {
-            party.sendPlay(seconds);
-          }
-        } else if (latestSecondsRef.current !== null) {
-          if (!party.isRemoteSyncingRef.current && party.room) {
-            party.sendPlay(latestSecondsRef.current);
-          }
+        const curSec = seconds ?? latestSecondsRef.current ?? 0;
+        latestSecondsRef.current = curSec;
+        if (!party.isRemoteSyncingRef.current && party.room) {
+          party.sendPlay(curSec);
         }
         return;
       }
@@ -909,6 +923,7 @@ function WatchPage() {
       // Handle timeupdate events (sent continuously while playing)
       if (eventName === "timeupdate" || eventName === "time") {
         if (seconds !== null && Number.isFinite(seconds) && seconds >= 0) {
+          latestSecondsRef.current = seconds;
           persistMarker(seconds, false);
         }
         return;
@@ -916,6 +931,7 @@ function WatchPage() {
 
       // Generic fallback if seconds were extracted
       if (seconds !== null && Number.isFinite(seconds) && seconds >= 0) {
+        latestSecondsRef.current = seconds;
         persistMarker(seconds, false);
       }
     };

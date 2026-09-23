@@ -30,6 +30,27 @@ export function getOrCreateGuestId(): string {
   }
 }
 
+export function mergeChatMessages(existing: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
+  const result = [...existing];
+  for (const msg of incoming) {
+    if (!msg || !msg.text) continue;
+    const isDuplicate = result.some(
+      (m) =>
+        (msg.id && m.id === msg.id) ||
+        (m.sender?.id === msg.sender?.id &&
+          m.text === msg.text &&
+          Math.abs(m.timestamp - msg.timestamp) < 4000) ||
+        (m.sender?.name === msg.sender?.name &&
+          m.text === msg.text &&
+          Math.abs(m.timestamp - msg.timestamp) < 4000),
+    );
+    if (!isDuplicate) {
+      result.push(msg);
+    }
+  }
+  return result;
+}
+
 interface UseWatchPartyOptions {
   roomCode: string | null;
   initialRoom?: WatchPartyRoom | null;
@@ -257,28 +278,9 @@ export function useWatchParty({
     async (text: string) => {
       const trimmed = text.trim();
       if (!trimmed) return;
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        void sendEvent({ type: "CHAT", text: trimmed });
-      } else if (roomCode) {
-        // Optimistically display chat message immediately for instant feedback
-        const myId = currentAccountIdRef.current ?? viewer?.id ?? 0;
-        const myMember = members.find((m) => m.id === myId);
-        const optimisticMsg: ChatMessage = {
-          id: `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
-          text: trimmed,
-          sender: {
-            id: myId,
-            name: myMember?.name ?? viewer?.name ?? "Tu",
-            color: myMember?.color ?? viewer?.color ?? "#6366f1",
-            profilePicture: myMember?.profilePicture ?? viewer?.profilePicture,
-          },
-          timestamp: Date.now(),
-        };
-        setChatMessages((prev) => [...prev, optimisticMsg]);
-        await sendEvent({ type: "CHAT", text: trimmed });
-      }
+      void sendEvent({ type: "CHAT", text: trimmed });
     },
-    [sendEvent, roomCode, members, viewer],
+    [sendEvent],
   );
 
   // Connect to the room (Dual-Mode: WebSocket primary + HTTP polling fallback)
@@ -383,11 +385,7 @@ export function useWatchParty({
               }
 
               if (Array.isArray(data.room.chatHistory) && data.room.chatHistory.length > 0) {
-                setChatMessages((prev) => {
-                  const existingIds = new Set(prev.map((m) => m.id));
-                  const newMsgs = (data.room.chatHistory || []).filter((m) => !existingIds.has(m.id));
-                  return newMsgs.length > 0 ? [...prev, ...newMsgs] : prev;
-                });
+                setChatMessages((prev) => mergeChatMessages(prev, data.room.chatHistory as ChatMessage[]));
               }
             }
 
@@ -587,7 +585,7 @@ export function useWatchParty({
           setMembers(msg.data.members);
           setCurrentAccountId(msg.yourAccountId);
           if (Array.isArray(msg.data.chatHistory)) {
-            setChatMessages(msg.data.chatHistory);
+            setChatMessages((prev) => mergeChatMessages(prev, msg.data.chatHistory as ChatMessage[]));
           }
 
           // If member is not host, synchronize media and initial playback state
@@ -691,36 +689,13 @@ export function useWatchParty({
           break;
         }
         case "CHAT": {
-          setChatMessages((prev) => {
-            if (msg.id && prev.some((m) => m.id === msg.id)) {
-              return prev;
-            }
-            // Check if there's an optimistic message with same text from same sender
-            const hasSimilarOptimistic = prev.some(
-              (m) =>
-                m.sender.id === msg.sender.id &&
-                m.text === msg.text &&
-                Math.abs(m.timestamp - msg.timestamp) < 4000,
-            );
-            if (hasSimilarOptimistic) {
-              return prev.map((m) =>
-                m.sender.id === msg.sender.id &&
-                m.text === msg.text &&
-                Math.abs(m.timestamp - msg.timestamp) < 4000
-                  ? { ...m, id: msg.id || m.id }
-                  : m,
-              );
-            }
-            return [
-              ...prev,
-              {
-                id: msg.id || `${msg.timestamp}-${Math.random().toString(36).substring(2, 7)}`,
-                text: msg.text,
-                sender: msg.sender,
-                timestamp: msg.timestamp,
-              },
-            ];
-          });
+          const newMsg: ChatMessage = {
+            id: msg.id || `${msg.timestamp}-${Math.random().toString(36).substring(2, 7)}`,
+            text: msg.text,
+            sender: msg.sender,
+            timestamp: msg.timestamp,
+          };
+          setChatMessages((prev) => mergeChatMessages(prev, [newMsg]));
           break;
         }
         case "ERROR": {
@@ -799,12 +774,12 @@ export function useWatchParty({
       wsRef.current.close(1000);
       wsRef.current = null;
     }
-    if (roomCode) {
-      const clean = roomCode.trim().toUpperCase();
-      roomStateCache.delete(clean);
+    const targetCode = (roomCode || room?.code || "").trim().toUpperCase();
+    if (targetCode) {
+      roomStateCache.delete(targetCode);
       void leavePartyRoom({
         data: {
-          code: clean,
+          code: targetCode,
           guestId: getOrCreateGuestId(),
         },
       });
@@ -815,7 +790,7 @@ export function useWatchParty({
     setIsConnecting(false);
     setError(null);
     setChatMessages([]);
-  }, [roomCode]);
+  }, [roomCode, room]);
 
   return {
     room,
