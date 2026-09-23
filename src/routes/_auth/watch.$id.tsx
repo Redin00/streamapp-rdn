@@ -66,22 +66,53 @@ function sendIframePlayerCommand(
 ) {
   if (!iframe || !iframe.contentWindow) return;
   const cw = iframe.contentWindow;
+
   if (command === "seek" && typeof time === "number") {
-    cw.postMessage({ type: "seek", time }, "*");
-    cw.postMessage({ method: "seek", value: time }, "*");
-    cw.postMessage({ event: "seek", time }, "*");
-    cw.postMessage({ action: "seek", value: time }, "*");
-    cw.postMessage(`seek:${time}`, "*");
+    const rounded = Math.floor(time * 10) / 10;
+    cw.postMessage({ type: "seek", time: rounded }, "*");
+    cw.postMessage({ method: "seek", value: rounded }, "*");
+    cw.postMessage({ event: "seek", time: rounded }, "*");
+    cw.postMessage({ action: "seek", value: rounded, time: rounded }, "*");
+    cw.postMessage({ action: "start", value: rounded, time: rounded }, "*");
+    cw.postMessage({ api: "seek", time: rounded }, "*");
+    cw.postMessage(`seek:${rounded}`, "*");
+    cw.postMessage(`start:${rounded}`, "*");
+    try {
+      cw.postMessage(JSON.stringify({ type: "seek", time: rounded }), "*");
+      cw.postMessage(JSON.stringify({ method: "seek", value: rounded }), "*");
+      cw.postMessage(JSON.stringify({ event: "seek", time: rounded }), "*");
+      cw.postMessage(JSON.stringify({ action: "seek", value: rounded }), "*");
+      cw.postMessage(JSON.stringify({ action: "start", value: rounded }), "*");
+      cw.postMessage(JSON.stringify({ event: "command", func: "seekTo", args: [rounded, true] }), "*");
+    } catch {}
   } else if (command === "play") {
     cw.postMessage({ type: "play" }, "*");
     cw.postMessage({ method: "play" }, "*");
+    cw.postMessage({ event: "play" }, "*");
     cw.postMessage({ action: "play" }, "*");
+    cw.postMessage({ api: "play" }, "*");
     cw.postMessage("play", "*");
+    try {
+      cw.postMessage(JSON.stringify({ type: "play" }), "*");
+      cw.postMessage(JSON.stringify({ method: "play" }), "*");
+      cw.postMessage(JSON.stringify({ event: "play" }), "*");
+      cw.postMessage(JSON.stringify({ action: "play" }), "*");
+      cw.postMessage(JSON.stringify({ event: "command", func: "playVideo", args: "" }), "*");
+    } catch {}
   } else if (command === "pause") {
     cw.postMessage({ type: "pause" }, "*");
     cw.postMessage({ method: "pause" }, "*");
+    cw.postMessage({ event: "pause" }, "*");
     cw.postMessage({ action: "pause" }, "*");
+    cw.postMessage({ api: "pause" }, "*");
     cw.postMessage("pause", "*");
+    try {
+      cw.postMessage(JSON.stringify({ type: "pause" }), "*");
+      cw.postMessage(JSON.stringify({ method: "pause" }), "*");
+      cw.postMessage(JSON.stringify({ event: "pause" }), "*");
+      cw.postMessage(JSON.stringify({ action: "pause" }), "*");
+      cw.postMessage(JSON.stringify({ event: "command", func: "pauseVideo", args: "" }), "*");
+    } catch {}
   }
 }
 
@@ -203,7 +234,6 @@ function WatchPage() {
   const [isCreatingParty, setIsCreatingParty] = useState(false);
   const [partyDialogOpen, setPartyDialogOpen] = useState(Boolean(searchPartyCode));
   const [isLocalPlaying, setIsLocalPlaying] = useState(false);
-  const [vixsrcStartAt, setVixsrcStartAt] = useState<number | null>(null);
 
   const hlsPlayerRef = useRef<HlsPlayerHandle>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
@@ -232,11 +262,15 @@ function WatchPage() {
   const onRemotePlay = useCallback(
     (time: number) => {
       setIsLocalPlaying(true);
+      latestSecondsRef.current = time;
       if (playlistUrl && !hlsFailed) {
         hlsPlayerRef.current?.seek(time);
         hlsPlayerRef.current?.play();
       } else {
-        sendIframePlayerCommand(iframeRef.current, "seek", time);
+        const cur = latestSecondsRef.current ?? 0;
+        if (Math.abs(cur - time) > 2.5) {
+          sendIframePlayerCommand(iframeRef.current, "seek", time);
+        }
         sendIframePlayerCommand(iframeRef.current, "play");
       }
     },
@@ -246,11 +280,10 @@ function WatchPage() {
   const onRemotePause = useCallback(
     (time: number) => {
       setIsLocalPlaying(false);
+      latestSecondsRef.current = time;
       if (playlistUrl && !hlsFailed) {
-        hlsPlayerRef.current?.seek(time);
         hlsPlayerRef.current?.pause();
       } else {
-        sendIframePlayerCommand(iframeRef.current, "seek", time);
         sendIframePlayerCommand(iframeRef.current, "pause");
       }
     },
@@ -264,7 +297,6 @@ function WatchPage() {
         hlsPlayerRef.current?.seek(time);
       } else {
         sendIframePlayerCommand(iframeRef.current, "seek", time);
-        setVixsrcStartAt(Math.floor(time));
       }
     },
     [playlistUrl, hlsFailed],
@@ -344,6 +376,41 @@ function WatchPage() {
     getCurrentTime,
     getIsPlaying,
   });
+
+  // Guest auto-synchronizes to host's movie/episode whenever room is loaded or changes
+  useEffect(() => {
+    if (!party.room || party.isHost) return;
+    const media = party.room.media;
+    if (!media || !media.slug) return;
+
+    const isDifferentSlug = media.slug !== slug;
+    const targetSeason = media.type === "tv" ? (media.season ?? 1) : undefined;
+    const targetEpisode = media.type === "tv" ? (media.episode ?? 1) : undefined;
+    const currentSeason = activeSeason?.number;
+    const currentEpisode = activeEpisode?.number;
+    const isDifferentEpisode =
+      media.type === "tv" &&
+      (targetSeason !== currentSeason || targetEpisode !== currentEpisode);
+
+    if (isDifferentSlug || isDifferentEpisode) {
+      console.info("Syncing guest to host media:", media.slug, targetSeason, targetEpisode);
+      const code = (party.room.code || partyCode || searchPartyCode || "").trim().toUpperCase();
+      if (code) {
+        try {
+          sessionStorage.setItem("cinemagic_watch_party", code);
+        } catch {}
+      }
+      void navigate({
+        to: "/watch/$id",
+        params: { id: media.slug },
+        search: {
+          s: targetSeason,
+          e: targetEpisode,
+          party: code || undefined,
+        },
+      });
+    }
+  }, [party.room, party.isHost, slug, activeSeason?.number, activeEpisode?.number, navigate, partyCode, searchPartyCode]);
 
   // Host broadcasts media changes when switching episodes
   useEffect(() => {
@@ -427,6 +494,37 @@ function WatchPage() {
     try {
       sessionStorage.setItem("cinemagic_watch_party", cleanCode);
     } catch {}
+
+    // Fetch room state via REST so UI loads immediately and guest syncs to host's media
+    try {
+      const res = await getPartyRoom({ data: { code: cleanCode } });
+      if (res.ok && res.room) {
+        party.setRoom(res.room);
+        const targetMedia = res.room.media;
+        if (targetMedia && targetMedia.slug) {
+          const isDiffSlug = targetMedia.slug !== slug;
+          const targetSeason = targetMedia.type === "tv" ? targetMedia.season ?? 1 : undefined;
+          const targetEpisode = targetMedia.type === "tv" ? targetMedia.episode ?? 1 : undefined;
+          const isDiffEp =
+            targetMedia.type === "tv" &&
+            (targetSeason !== activeSeason?.number || targetEpisode !== activeEpisode?.number);
+
+          if (isDiffSlug || isDiffEp) {
+            void navigate({
+              to: "/watch/$id",
+              params: { id: targetMedia.slug },
+              search: {
+                s: targetSeason,
+                e: targetEpisode,
+                party: cleanCode,
+              },
+            });
+            return;
+          }
+        }
+      }
+    } catch {}
+
     void navigate({
       to: "/watch/$id",
       params: { id },
@@ -437,13 +535,6 @@ function WatchPage() {
       },
       replace: true,
     });
-    // Optimistically fetch the room state via REST so UI loads immediately
-    try {
-      const res = await getPartyRoom({ data: { code: cleanCode } });
-      if (res.ok && res.room) {
-        party.setRoom(res.room);
-      }
-    } catch {}
   };
 
   const handleLeaveParty = () => {
@@ -464,7 +555,7 @@ function WatchPage() {
     });
   };
 
-  const startSecond = vixsrcStartAt ?? marker ?? undefined;
+  const startSecond = marker ?? undefined;
   const resumeEmbedUrl =
     embedUrl && title?.tmdbId
       ? buildEmbedUrl(player, {
