@@ -66,3 +66,19 @@ export type PartyEvent =
       timestamp: number;
     }
   | { type: "ERROR"; message: string };
+
+export interface PartyPollResponse {
+  ok: boolean;
+  room: WatchPartyRoom;
+  events: PartyEvent[];
+  yourAccountId: number;
+  now: number;
+}
+
+export interface PartyEventResponse {
+  ok: boolean;
+  room: WatchPartyRoom;
+  event?: PartyEvent | null;
+  now: number;
+}
+

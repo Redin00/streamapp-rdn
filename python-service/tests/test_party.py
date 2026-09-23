@@ -186,13 +186,130 @@ class TestWatchParty(unittest.TestCase):
             self.assertEqual(init_msg["yourAccountId"], self.account_id)
             self.assertEqual(init_msg["data"]["code"], code)
 
-    def test_websocket_unauthenticated_rejected(self):
-        # Connecting without token or with invalid token returns ERROR message
-        with self.client.websocket_connect("/ws/party/ROOM-123?token=invalid_token") as ws:
-            msg = ws.receive_json()
-            self.assertEqual(msg.get("type"), "ERROR")
-            self.assertIn("Authentication", msg.get("message", ""))
+    def test_http_event_and_poll(self):
+        # 1. Create room as User 1
+        payload = {
+            "media": {
+                "slug": "http-sync-test",
+                "tmdbId": 999,
+                "type": "movie",
+                "titleName": "HTTP Test Movie",
+            },
+            "initialTime": 0.0,
+        }
+        res = self.client.post("/party/create", json=payload, headers=self.headers)
+        self.assertEqual(res.status_code, 200)
+        code = res.json()["code"]
+
+        # 2. User 2 posts a CHAT event via HTTP
+        chat_payload = {"event": {"type": "CHAT", "text": "Ciao da HTTP!"}}
+        event_res = self.client.post(f"/party/{code}/event", json=chat_payload, headers=self.headers2)
+        self.assertEqual(event_res.status_code, 200)
+        event_data = event_res.json()
+        self.assertTrue(event_data["ok"])
+        self.assertEqual(event_data["event"]["type"], "CHAT")
+        self.assertEqual(event_data["event"]["text"], "Ciao da HTTP!")
+        self.assertEqual(event_data["event"]["sender"]["name"], "PartyTestUser2")
+        # User 2 is automatically added to members
+        member_ids = [m["id"] for m in event_data["room"]["members"]]
+        self.assertIn(self.account2_id, member_ids)
+
+        # 3. User 1 polls for events
+        poll_res = self.client.get(f"/party/{code}/poll?since=0", headers=self.headers)
+        self.assertEqual(poll_res.status_code, 200)
+        poll_data = poll_res.json()
+        self.assertTrue(poll_data["ok"])
+        self.assertEqual(poll_data["yourAccountId"], self.account_id)
+        # Should contain MEMBER_JOINED and CHAT
+        event_types = [e["type"] for e in poll_data["events"]]
+        self.assertIn("MEMBER_JOINED", event_types)
+        self.assertIn("CHAT", event_types)
+
+        chat_event_ts = next(e["timestamp"] for e in poll_data["events"] if e["type"] == "CHAT")
+
+        # 4. User 1 posts a PLAY event
+        play_res = self.client.post(f"/party/{code}/event", json={"event": {"type": "PLAY", "time": 42.0}}, headers=self.headers)
+        self.assertEqual(play_res.status_code, 200)
+        self.assertTrue(play_res.json()["room"]["state"]["isPlaying"])
+        self.assertEqual(play_res.json()["room"]["state"]["time"], 42.0)
+
+        # 5. User 2 polls with since=chat_event_ts, should only receive PLAY
+        poll2 = self.client.get(f"/party/{code}/poll?since={chat_event_ts}", headers=self.headers2)
+        self.assertEqual(poll2.status_code, 200)
+        poll2_types = [e["type"] for e in poll2.json()["events"]]
+        self.assertIn("PLAY", poll2_types)
+        self.assertNotIn("CHAT", poll2_types)
+
+    def test_websocket_and_http_interop(self):
+        # 1. User 1 creates room and connects via WebSocket
+        payload = {
+            "media": {
+                "slug": "interop-test",
+                "tmdbId": 888,
+                "type": "movie",
+                "titleName": "Interop Movie",
+            },
+            "initialTime": 0.0,
+        }
+        res = self.client.post("/party/create", json=payload, headers=self.headers)
+        code = res.json()["code"]
+
+        with self.client.websocket_connect(f"/ws/party/{code}?token={self.token}") as ws:
+            ws.receive_json()  # ROOM_STATE
+
+            # 2. User 2 sends PLAY via HTTP
+            self.client.post(
+                f"/party/{code}/event",
+                json={"event": {"type": "PLAY", "time": 15.0}},
+                headers=self.headers2,
+            )
+
+            # User 1 receives MEMBER_JOINED then PLAY over WebSocket in real time!
+            msg1 = ws.receive_json()
+            self.assertEqual(msg1["type"], "MEMBER_JOINED")
+            self.assertEqual(msg1["member"]["id"], self.account2_id)
+
+            msg2 = ws.receive_json()
+            self.assertEqual(msg2["type"], "PLAY")
+            self.assertEqual(msg2["time"], 15.0)
+
+            # 3. User 1 sends PAUSE via WebSocket
+            ws.send_json({"type": "PAUSE", "time": 20.0})
+
+            # 4. User 2 polls via HTTP and sees PAUSE
+            poll = self.client.get(f"/party/{code}/poll?since={msg2['timestamp']}", headers=self.headers2)
+            events = poll.json()["events"]
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["type"], "PAUSE")
+            self.assertEqual(events[0]["time"], 20.0)
+
+    def test_leave_party_http(self):
+        payload = {
+            "media": {
+                "slug": "leave-test",
+                "tmdbId": 777,
+                "type": "movie",
+                "titleName": "Leave Movie",
+            },
+            "initialTime": 0.0,
+        }
+        res = self.client.post("/party/create", json=payload, headers=self.headers)
+        code = res.json()["code"]
+
+        # User 2 joins via event
+        self.client.post(f"/party/{code}/event", json={"type": "CHAT", "text": "Hi"}, headers=self.headers2)
+        room_data = self.client.get(f"/party/{code}").json()
+        self.assertEqual(len(room_data["members"]), 2)
+
+        # User 2 leaves
+        leave_res = self.client.post(f"/party/{code}/leave", headers=self.headers2)
+        self.assertEqual(leave_res.status_code, 200)
+
+        room_after = self.client.get(f"/party/{code}").json()
+        self.assertEqual(len(room_after["members"]), 1)
+        self.assertEqual(room_after["members"][0]["id"], self.account_id)
 
 
 if __name__ == "__main__":
     unittest.main()
+

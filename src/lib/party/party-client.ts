@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { getPartyConnectionInfo } from "./party.functions";
+import {
+  getPartyConnectionInfo,
+  leavePartyRoom,
+  pollPartyRoom,
+  sendPartyEvent,
+} from "./party.functions";
 import type { ChatMessage, PartyEvent, PartyMedia, PartyMember, WatchPartyRoom } from "./types";
 
 interface UseWatchPartyOptions {
@@ -35,9 +40,17 @@ export function useWatchParty({
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>(initialRoom?.chatHistory ?? []);
 
   const wsRef = useRef<WebSocket | null>(null);
+  const wsConnectedRef = useRef(false);
+  const isPollingRef = useRef(false);
   const isRemoteSyncingRef = useRef(false);
   const isDeadRoomRef = useRef(false);
   const syncTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const currentAccountIdRef = useRef<number | null>(null);
+  currentAccountIdRef.current = currentAccountId;
+
+  const lastEventTsRef = useRef<number>(initialRoom?.createdAt ?? Date.now() - 5000);
 
   // Sync initialRoom when passed or updated from caller
   useEffect(() => {
@@ -88,52 +101,109 @@ export function useWatchParty({
     room && currentAccountId !== null && room.hostId === currentAccountId,
   );
 
-  // Send raw payload over WS if open
-  const sendEvent = useCallback((event: Record<string, unknown>) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(event));
-    }
-  }, []);
+  // Dual-mode send: uses WebSocket if open, falls back to HTTP POST
+  const sendEvent = useCallback(
+    async (event: Record<string, unknown>) => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify(event));
+      } else if (roomCode) {
+        try {
+          const res = await sendPartyEvent({
+            data: {
+              code: roomCode.trim().toUpperCase(),
+              event,
+            },
+          });
+          if (res.ok && res.room) {
+            setRoom(res.room);
+            setMembers(res.room.members);
+          }
+        } catch (e) {
+          console.error("Failed to send party event via HTTP:", e);
+        }
+      }
+    },
+    [roomCode],
+  );
 
-  const sendPlay = useCallback((time: number) => {
-    if (isRemoteSyncingRef.current) return;
-    sendEvent({ type: "PLAY", time });
-  }, [sendEvent]);
+  const sendPlay = useCallback(
+    (time: number) => {
+      if (isRemoteSyncingRef.current) return;
+      void sendEvent({ type: "PLAY", time });
+    },
+    [sendEvent],
+  );
 
-  const sendPause = useCallback((time: number) => {
-    if (isRemoteSyncingRef.current) return;
-    sendEvent({ type: "PAUSE", time });
-  }, [sendEvent]);
+  const sendPause = useCallback(
+    (time: number) => {
+      if (isRemoteSyncingRef.current) return;
+      void sendEvent({ type: "PAUSE", time });
+    },
+    [sendEvent],
+  );
 
-  const sendSeek = useCallback((time: number) => {
-    if (isRemoteSyncingRef.current) return;
-    sendEvent({ type: "SEEK", time });
-  }, [sendEvent]);
+  const sendSeek = useCallback(
+    (time: number) => {
+      if (isRemoteSyncingRef.current) return;
+      void sendEvent({ type: "SEEK", time });
+    },
+    [sendEvent],
+  );
 
-  const sendSyncTick = useCallback((time: number, isPlaying: boolean) => {
-    sendEvent({ type: "SYNC_TICK", time, isPlaying });
-  }, [sendEvent]);
+  const sendSyncTick = useCallback(
+    (time: number, isPlaying: boolean) => {
+      void sendEvent({ type: "SYNC_TICK", time, isPlaying });
+    },
+    [sendEvent],
+  );
 
-  const sendChangeMedia = useCallback((media: PartyMedia, time = 0) => {
-    sendEvent({ type: "CHANGE_MEDIA", media, time });
-  }, [sendEvent]);
+  const sendChangeMedia = useCallback(
+    (media: PartyMedia, time = 0) => {
+      void sendEvent({ type: "CHANGE_MEDIA", media, time });
+    },
+    [sendEvent],
+  );
 
-  const sendChat = useCallback((text: string) => {
-    const trimmed = text.trim();
-    if (!trimmed) return;
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      sendEvent({ type: "CHAT", text: trimmed });
-    } else {
-      console.warn("Watch Party WebSocket not connected. Cannot send chat message.");
-    }
-  }, [sendEvent]);
+  const sendChat = useCallback(
+    async (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed) return;
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        void sendEvent({ type: "CHAT", text: trimmed });
+      } else if (roomCode) {
+        // Optimistically display chat message immediately for instant feedback
+        const myId = currentAccountIdRef.current ?? 0;
+        const myMember = members.find((m) => m.id === myId);
+        const optimisticMsg: ChatMessage = {
+          id: `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+          text: trimmed,
+          sender: {
+            id: myId,
+            name: myMember?.name ?? "Tu",
+            color: myMember?.color ?? "#6366f1",
+            profilePicture: myMember?.profilePicture,
+          },
+          timestamp: Date.now(),
+        };
+        setChatMessages((prev) => [...prev, optimisticMsg]);
+        await sendEvent({ type: "CHAT", text: trimmed });
+      }
+    },
+    [sendEvent, roomCode, members],
+  );
 
-  // Connect to the room WebSocket (depends ONLY on roomCode)
+  // Connect to the room (Dual-Mode: WebSocket primary + HTTP polling fallback)
   useEffect(() => {
     if (!roomCode) {
       if (wsRef.current) {
         wsRef.current.close(1000);
         wsRef.current = null;
+      }
+      if (pollTimerRef.current) {
+        clearTimeout(pollTimerRef.current);
+      }
+      if (fallbackTimerRef.current) {
+        clearTimeout(fallbackTimerRef.current);
       }
       setRoom(null);
       setMembers([]);
@@ -147,8 +217,97 @@ export function useWatchParty({
     let active = true;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     isDeadRoomRef.current = false;
+    wsConnectedRef.current = false;
+    isPollingRef.current = false;
     setIsConnecting(true);
     setError(null);
+    lastEventTsRef.current = initialRoom?.createdAt ?? Date.now() - 5000;
+
+    const cleanCode = roomCode.trim().toUpperCase();
+
+    function startHttpPolling() {
+      if (!active || isDeadRoomRef.current || isPollingRef.current) return;
+      isPollingRef.current = true;
+      console.info("Watch party: activating HTTP sync fallback for room", cleanCode);
+
+      async function doPoll() {
+        if (!active || isDeadRoomRef.current) {
+          isPollingRef.current = false;
+          return;
+        }
+
+        try {
+          const res = await pollPartyRoom({
+            data: {
+              code: cleanCode,
+              since: lastEventTsRef.current,
+            },
+          });
+
+          if (!active || isDeadRoomRef.current) {
+            isPollingRef.current = false;
+            return;
+          }
+
+          if (res.ok && res.data) {
+            setIsConnected(true);
+            setIsConnecting(false);
+            setError(null);
+
+            const data = res.data;
+            if (data.yourAccountId !== undefined) {
+              setCurrentAccountId((prev) => prev ?? data.yourAccountId);
+            }
+            if (data.room) {
+              setRoom(data.room);
+              setMembers(data.room.members);
+              if (Array.isArray(data.room.chatHistory) && data.room.chatHistory.length > 0) {
+                setChatMessages((prev) => {
+                  const existingIds = new Set(prev.map((m) => m.id));
+                  const newMsgs = (data.room.chatHistory || []).filter((m) => !existingIds.has(m.id));
+                  return newMsgs.length > 0 ? [...prev, ...newMsgs] : prev;
+                });
+              }
+            }
+
+            if (Array.isArray(data.events) && data.events.length > 0) {
+              for (const ev of data.events) {
+                if (ev && typeof ev === "object" && "timestamp" in ev && typeof ev.timestamp === "number") {
+                  lastEventTsRef.current = Math.max(lastEventTsRef.current, ev.timestamp);
+                }
+                handlePartyEvent(ev);
+              }
+            }
+          } else if (res.message) {
+            const lower = res.message.toLowerCase();
+            if (lower.includes("not found") || lower.includes("non trovat") || lower.includes("scadut")) {
+              isDeadRoomRef.current = true;
+              isPollingRef.current = false;
+              setIsConnected(false);
+              setIsConnecting(false);
+              setError(res.message);
+              try {
+                sessionStorage.removeItem("cinemagic_watch_party");
+              } catch {}
+              onRoomNotFoundRef.current?.();
+              return;
+            }
+          }
+        } catch (err) {
+          console.warn("Watch party HTTP poll error:", err);
+        }
+
+        if (active && !isDeadRoomRef.current) {
+          // If WS is open, poll rarely as fallback backup; otherwise poll every 1.5s
+          const nextDelay = wsConnectedRef.current ? 10000 : 1500;
+          pollTimerRef.current = setTimeout(doPoll, nextDelay);
+        } else {
+          isPollingRef.current = false;
+        }
+      }
+
+      void doPoll();
+    }
 
     async function initWs() {
       try {
@@ -168,7 +327,6 @@ export function useWatchParty({
 
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
         const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : "";
-        const cleanCode = roomCode!.trim().toUpperCase();
 
         // 1. Determine primary WebSocket host
         let primaryHost = window.location.host;
@@ -193,6 +351,7 @@ export function useWatchParty({
               ws.close(1000);
               return;
             }
+            wsConnectedRef.current = true;
             setIsConnected(true);
             setIsConnecting(false);
             setError(null);
@@ -210,7 +369,7 @@ export function useWatchParty({
 
           ws.onerror = (err) => {
             console.error("Watch party WebSocket error connecting to", url, err);
-            // If primary host on a non-standard port failed without reverse proxy, try direct port fallback
+            // If primary host failed on non-standard port, try direct port fallback
             if (
               !attemptedDirectFallback &&
               window.location.port &&
@@ -223,38 +382,52 @@ export function useWatchParty({
               tryConnect(directPortUrl);
               return;
             }
-            if (active) {
-              setIsConnecting(false);
+            // Trigger HTTP polling immediately when WebSocket fails
+            if (active && !isDeadRoomRef.current) {
+              startHttpPolling();
             }
           };
 
           ws.onclose = (event) => {
+            wsConnectedRef.current = false;
             if (!active) return;
-            setIsConnected(false);
-            setIsConnecting(false);
             if (isDeadRoomRef.current) {
+              setIsConnected(false);
+              setIsConnecting(false);
               return;
             }
             if (event.code === 1008) {
+              setIsConnected(false);
+              setIsConnecting(false);
               setError("Autenticazione richiesta o fallita");
-            } else if (event.code === 1000) {
-              // Normal close
-            } else {
-              // Transient closure - try to reconnect if still active
+              return;
+            }
+
+            // Immediately engage HTTP polling fallback so client is never disconnected
+            startHttpPolling();
+
+            if (event.code !== 1000) {
+              // Background reconnect attempt for WebSocket
               reconnectTimer = setTimeout(() => {
-                if (active && !isDeadRoomRef.current) {
+                if (active && !isDeadRoomRef.current && !wsConnectedRef.current) {
                   initWs();
                 }
-              }, 3000);
+              }, 5000);
             }
           };
         }
 
         tryConnect(wsUrl);
+
+        // Safety fallback timer: if WebSocket is not connected within 1.5s, start HTTP polling
+        fallbackTimerRef.current = setTimeout(() => {
+          if (active && !wsConnectedRef.current && !isDeadRoomRef.current) {
+            startHttpPolling();
+          }
+        }, 1500);
       } catch (err) {
         if (active && !isDeadRoomRef.current) {
-          setIsConnecting(false);
-          setError("Impossibile connettersi al server del Watch Party");
+          startHttpPolling();
         }
       }
     }
@@ -299,6 +472,10 @@ export function useWatchParty({
           break;
         }
         case "PLAY": {
+          // Do not re-seek if this client was the sender
+          if ("senderId" in msg && currentAccountIdRef.current && msg.senderId === currentAccountIdRef.current) {
+            break;
+          }
           withRemoteSync(() => {
             if (onRemoteSeekRef.current) onRemoteSeekRef.current(msg.time);
             if (onRemotePlayRef.current) onRemotePlayRef.current(msg.time);
@@ -309,6 +486,9 @@ export function useWatchParty({
           break;
         }
         case "PAUSE": {
+          if ("senderId" in msg && currentAccountIdRef.current && msg.senderId === currentAccountIdRef.current) {
+            break;
+          }
           withRemoteSync(() => {
             if (onRemoteSeekRef.current) onRemoteSeekRef.current(msg.time);
             if (onRemotePauseRef.current) onRemotePauseRef.current(msg.time);
@@ -319,6 +499,9 @@ export function useWatchParty({
           break;
         }
         case "SEEK": {
+          if ("senderId" in msg && currentAccountIdRef.current && msg.senderId === currentAccountIdRef.current) {
+            break;
+          }
           withRemoteSync(() => {
             if (onRemoteSeekRef.current) onRemoteSeekRef.current(msg.time);
           });
@@ -328,7 +511,7 @@ export function useWatchParty({
           break;
         }
         case "SYNC_TICK": {
-          if (room && currentAccountId !== room.hostId && getCurrentTimeRef.current) {
+          if (room && currentAccountIdRef.current !== room.hostId && getCurrentTimeRef.current) {
             const current = getCurrentTimeRef.current();
             const diff = Math.abs(current - msg.time);
             if (diff > 2.5) {
@@ -342,6 +525,9 @@ export function useWatchParty({
           break;
         }
         case "CHANGE_MEDIA": {
+          if ("senderId" in msg && currentAccountIdRef.current && msg.senderId === currentAccountIdRef.current) {
+            break;
+          }
           if (onRemoteMediaChangeRef.current) {
             onRemoteMediaChangeRef.current(msg.media, roomCode || undefined);
           }
@@ -352,9 +538,24 @@ export function useWatchParty({
         }
         case "CHAT": {
           setChatMessages((prev) => {
-            // Avoid duplicate message by id if already present
             if (msg.id && prev.some((m) => m.id === msg.id)) {
               return prev;
+            }
+            // Check if there's an optimistic message with same text from same sender
+            const hasSimilarOptimistic = prev.some(
+              (m) =>
+                m.sender.id === msg.sender.id &&
+                m.text === msg.text &&
+                Math.abs(m.timestamp - msg.timestamp) < 4000,
+            );
+            if (hasSimilarOptimistic) {
+              return prev.map((m) =>
+                m.sender.id === msg.sender.id &&
+                m.text === msg.text &&
+                Math.abs(m.timestamp - msg.timestamp) < 4000
+                  ? { ...m, id: msg.id || m.id }
+                  : m,
+              );
             }
             return [
               ...prev,
@@ -382,6 +583,12 @@ export function useWatchParty({
               clearTimeout(reconnectTimer);
               reconnectTimer = null;
             }
+            if (pollTimerRef.current) {
+              clearTimeout(pollTimerRef.current);
+            }
+            if (fallbackTimerRef.current) {
+              clearTimeout(fallbackTimerRef.current);
+            }
             try {
               sessionStorage.removeItem("cinemagic_watch_party");
             } catch {}
@@ -394,12 +601,18 @@ export function useWatchParty({
       }
     }
 
-    initWs();
+    void initWs();
 
     return () => {
       active = false;
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
+      }
+      if (fallbackTimerRef.current) {
+        clearTimeout(fallbackTimerRef.current);
+      }
+      if (pollTimerRef.current) {
+        clearTimeout(pollTimerRef.current);
       }
       if (wsRef.current) {
         wsRef.current.close(1000);
@@ -409,7 +622,7 @@ export function useWatchParty({
         clearTimeout(syncTimeoutRef.current);
       }
     };
-  }, [roomCode, withRemoteSync]);
+  }, [roomCode, withRemoteSync, initialRoom]);
 
   // Host heartbeat / sync tick (broadcast every 4 seconds)
   useEffect(() => {
@@ -424,11 +637,20 @@ export function useWatchParty({
     return () => clearInterval(interval);
   }, [isConnected, isHost, room, sendSyncTick]);
 
-  const leaveParty = useCallback(() => {
+  const leaveParty = useCallback(async () => {
     isDeadRoomRef.current = true;
+    if (fallbackTimerRef.current) clearTimeout(fallbackTimerRef.current);
+    if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
     if (wsRef.current) {
       wsRef.current.close(1000);
       wsRef.current = null;
+    }
+    if (roomCode) {
+      void leavePartyRoom({
+        data: {
+          code: roomCode.trim().toUpperCase(),
+        },
+      });
     }
     setRoom(null);
     setMembers([]);
@@ -436,7 +658,7 @@ export function useWatchParty({
     setIsConnecting(false);
     setError(null);
     setChatMessages([]);
-  }, []);
+  }, [roomCode]);
 
   return {
     room,

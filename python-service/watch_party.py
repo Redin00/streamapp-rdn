@@ -131,6 +131,7 @@ class PartyRoom:
         self.media = media
         self.host_id = host_account["id"]
         self.created_at = int(time.time() * 1000)
+        self.last_activity: float = time.time()
         self.state = PartyPlaybackState(
             time=initial_time,
             isPlaying=False,
@@ -145,11 +146,54 @@ class PartyRoom:
                 "isHost": True,
             }
         }
+        self.member_last_seen: Dict[int, float] = {host_account["id"]: time.time()}
         # account_id -> set of active WebSockets (supports multiple tabs / reconnects)
         self.connections: Dict[int, Set[WebSocket]] = {}
         # Recent chat messages persisted in memory for participants who join or reconnect
         self.chat_history: List[Dict[str, Any]] = []
+        # Recent broadcast events buffered for HTTP polling fallback clients
+        self.recent_events: List[Dict[str, Any]] = []
         self.lock = asyncio.Lock()
+
+    def touch(self, account_id: Optional[int] = None):
+        self.last_activity = time.time()
+        if account_id is not None:
+            self.member_last_seen[account_id] = self.last_activity
+
+    def record_event(self, event: Dict[str, Any]):
+        if "timestamp" not in event:
+            event["timestamp"] = int(time.time() * 1000)
+        if "id" not in event:
+            event["id"] = f"{event['timestamp']}-{secrets.token_hex(4)}"
+        self.recent_events.append(event)
+        if len(self.recent_events) > 100:
+            self.recent_events.pop(0)
+
+    async def ensure_member(self, account: Dict[str, Any]) -> bool:
+        """Register or refresh a member in the room. Returns True if this member is newly joined."""
+        account_id = account["id"]
+        self.touch(account_id)
+        is_new = False
+        async with self.lock:
+            if account_id not in self.members:
+                new_member = {
+                    "id": account_id,
+                    "name": account["name"],
+                    "color": account.get("color", "#6366f1"),
+                    "profilePicture": account.get("profile_picture") or account.get("profilePicture"),
+                    "isHost": (account_id == self.host_id),
+                }
+                self.members[account_id] = new_member
+                is_new = True
+
+        if is_new:
+            log.info("User %s (%s) joined room %s", account["name"], account_id, self.code)
+            await self.broadcast({
+                "type": "MEMBER_JOINED",
+                "member": self.members[account_id],
+                "members": list(self.members.values()),
+            }, exclude_account_id=account_id)
+        return is_new
 
     def get_room_state_dict(self) -> Dict[str, Any]:
         return {
@@ -172,7 +216,8 @@ class PartyRoom:
         }
 
     async def broadcast(self, message: Dict[str, Any], exclude_account_id: Optional[int] = None):
-        """Broadcast a JSON message to all connected participants."""
+        """Broadcast a JSON message to all connected WebSocket participants and record to recent_events."""
+        self.record_event(message)
         payload = json.dumps(message)
         dead_connections = []
         for account_id, sockets in list(self.connections.items()):
@@ -221,12 +266,143 @@ class PartyManager:
         async with self._lock:
             clean_code = code.upper().strip()
             room = self.rooms.get(clean_code)
-            if room and not room.connections:
-                log.info("Cleaning up empty watch party room after grace period: %s", clean_code)
-                self.rooms.pop(clean_code, None)
+            if room:
+                has_recent_http = (time.time() - room.last_activity) < 120.0
+                if not room.connections and not has_recent_http:
+                    log.info("Cleaning up empty watch party room after grace period: %s", clean_code)
+                    self.rooms.pop(clean_code, None)
 
 
 party_manager = PartyManager()
+
+
+# --------------------------------------------------------------------------- #
+# Event Application Helper
+# --------------------------------------------------------------------------- #
+
+async def apply_room_event(
+    room: PartyRoom,
+    account: Dict[str, Any],
+    msg: Dict[str, Any],
+    exclude_ws_account_id: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Applies a sync, playback, or chat event to the room state and broadcasts it."""
+    account_id = account["id"]
+    room.touch(account_id)
+    event_type = msg.get("type")
+    cur_time = float(msg.get("time", room.state.time))
+
+    if event_type == "PLAY":
+        async with room.lock:
+            room.state.isPlaying = True
+            room.state.time = cur_time
+            room.state.lastUpdated = int(time.time() * 1000)
+        event = {
+            "type": "PLAY",
+            "time": cur_time,
+            "senderId": account_id,
+            "senderName": account["name"],
+            "timestamp": room.state.lastUpdated,
+        }
+        await room.broadcast(event, exclude_account_id=exclude_ws_account_id)
+        return event
+
+    elif event_type == "PAUSE":
+        async with room.lock:
+            room.state.isPlaying = False
+            room.state.time = cur_time
+            room.state.lastUpdated = int(time.time() * 1000)
+        event = {
+            "type": "PAUSE",
+            "time": cur_time,
+            "senderId": account_id,
+            "senderName": account["name"],
+            "timestamp": room.state.lastUpdated,
+        }
+        await room.broadcast(event, exclude_account_id=exclude_ws_account_id)
+        return event
+
+    elif event_type == "SEEK":
+        async with room.lock:
+            room.state.time = cur_time
+            room.state.lastUpdated = int(time.time() * 1000)
+        event = {
+            "type": "SEEK",
+            "time": cur_time,
+            "senderId": account_id,
+            "senderName": account["name"],
+            "timestamp": room.state.lastUpdated,
+        }
+        await room.broadcast(event, exclude_account_id=exclude_ws_account_id)
+        return event
+
+    elif event_type == "SYNC_TICK":
+        if account_id == room.host_id:
+            async with room.lock:
+                room.state.time = cur_time
+                room.state.isPlaying = bool(msg.get("isPlaying", room.state.isPlaying))
+                room.state.lastUpdated = int(time.time() * 1000)
+            event = {
+                "type": "SYNC_TICK",
+                "time": cur_time,
+                "isPlaying": room.state.isPlaying,
+                "timestamp": room.state.lastUpdated,
+            }
+            await room.broadcast(event, exclude_account_id=exclude_ws_account_id)
+            return event
+        return None
+
+    elif event_type in ("CHANGE_MEDIA", "MEDIA_CHANGED"):
+        new_media_raw = msg.get("media")
+        if new_media_raw:
+            try:
+                new_media = MediaPayload(**new_media_raw)
+                time_val = float(msg.get("time", 0.0))
+                async with room.lock:
+                    room.media = new_media
+                    room.state.time = time_val
+                    room.state.isPlaying = False
+                    room.state.lastUpdated = int(time.time() * 1000)
+                event = {
+                    "type": "CHANGE_MEDIA",
+                    "media": new_media.model_dump(),
+                    "time": time_val,
+                    "senderId": account_id,
+                    "senderName": account["name"],
+                    "timestamp": room.state.lastUpdated,
+                }
+                await room.broadcast(event)
+                return event
+            except Exception as exc:
+                log.warning("Invalid media payload: %s", exc)
+        return None
+
+    elif event_type == "CHAT":
+        text = str(msg.get("text", "")).strip()[:500]
+        if text:
+            now_ms = int(time.time() * 1000)
+            chat_msg = {
+                "id": f"{now_ms}-{secrets.token_hex(4)}",
+                "type": "CHAT",
+                "text": text,
+                "timestamp": now_ms,
+                "sender": {
+                    "id": account_id,
+                    "name": account["name"],
+                    "color": account.get("color", "#6366f1"),
+                    "profilePicture": account.get("profile_picture") or account.get("profilePicture"),
+                },
+            }
+            async with room.lock:
+                room.chat_history.append(chat_msg)
+                if len(room.chat_history) > 100:
+                    room.chat_history.pop(0)
+            # Broadcast to everyone including sender
+            await room.broadcast(chat_msg)
+            return chat_msg
+        return None
+
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -249,7 +425,90 @@ async def get_party_endpoint(code: str):
     room = await party_manager.get_room(code)
     if not room:
         raise HTTPException(status_code=404, detail="Watch party room not found")
+    room.touch()
     return room.get_room_state_dict()
+
+
+@router.post("/{code}/event")
+async def post_party_event_endpoint(
+    code: str,
+    body: Dict[str, Any],
+    account: Dict[str, Any] = Depends(get_party_account),
+):
+    """Submit an event (PLAY, PAUSE, SEEK, SYNC_TICK, CHANGE_MEDIA, CHAT) via HTTP fallback."""
+    room = await party_manager.get_room(code)
+    if not room:
+        raise HTTPException(status_code=404, detail="Watch party room not found")
+    await room.ensure_member(account)
+    event_payload = body.get("event") if isinstance(body.get("event"), dict) else body
+    applied = await apply_room_event(room, account, event_payload, exclude_ws_account_id=None)
+    return {
+        "ok": True,
+        "room": room.get_room_state_dict(),
+        "event": applied,
+        "now": int(time.time() * 1000),
+    }
+
+
+@router.get("/{code}/poll")
+async def poll_party_endpoint(
+    code: str,
+    since: float = Query(default=0.0),
+    account: Dict[str, Any] = Depends(get_party_account),
+):
+    """Poll for new events and updated room state for HTTP sync clients."""
+    room = await party_manager.get_room(code)
+    if not room:
+        raise HTTPException(status_code=404, detail="Watch party room not found")
+    await room.ensure_member(account)
+    since_int = int(since)
+    new_events = [ev for ev in room.recent_events if ev.get("timestamp", 0) > since_int]
+    return {
+        "ok": True,
+        "room": room.get_room_state_dict(),
+        "events": new_events,
+        "yourAccountId": account["id"],
+        "now": int(time.time() * 1000),
+    }
+
+
+@router.post("/{code}/leave")
+async def leave_party_endpoint(
+    code: str,
+    account: Dict[str, Any] = Depends(get_party_account),
+):
+    """Leave the watch party room."""
+    room = await party_manager.get_room(code)
+    if not room:
+        return {"ok": True}
+    account_id = account["id"]
+    async with room.lock:
+        room.members.pop(account_id, None)
+        room.member_last_seen.pop(account_id, None)
+        if account_id in room.connections:
+            for ws in list(room.connections[account_id]):
+                try:
+                    await ws.close(code=status.WS_1000_NORMAL_CLOSURE)
+                except Exception:
+                    pass
+            room.connections.pop(account_id, None)
+
+        if account_id == room.host_id and room.members:
+            next_host_id = next(iter(room.members.keys()))
+            room.host_id = next_host_id
+            room.members[next_host_id]["isHost"] = True
+            await room.broadcast({
+                "type": "HOST_CHANGED",
+                "newHostId": next_host_id,
+                "members": list(room.members.values()),
+            })
+
+    await room.broadcast({
+        "type": "MEMBER_LEFT",
+        "memberId": account_id,
+        "members": list(room.members.values()),
+    })
+    return {"ok": True}
 
 
 # --------------------------------------------------------------------------- #
@@ -293,21 +552,13 @@ async def handle_party_websocket(websocket: WebSocket, code: str, token: Optiona
         return
 
     account_id = account["id"]
+    await room.ensure_member(account)
     async with room.lock:
         if account_id not in room.connections:
             room.connections[account_id] = set()
         room.connections[account_id].add(websocket)
 
-        # Register or update member info
-        room.members[account_id] = {
-            "id": account_id,
-            "name": account["name"],
-            "color": account.get("color", "#6366f1"),
-            "profilePicture": account.get("profile_picture"),
-            "isHost": (account_id == room.host_id),
-        }
-
-    log.info("User %s (%s) connected to party %s", account["name"], account_id, clean_code)
+    log.info("User %s (%s) connected to party %s via WebSocket", account["name"], account_id, clean_code)
 
     # 3. Send initial room state (including chat history) to the newly joined client
     await websocket.send_text(json.dumps({
@@ -316,14 +567,7 @@ async def handle_party_websocket(websocket: WebSocket, code: str, token: Optiona
         "yourAccountId": account_id,
     }))
 
-    # 4. Notify everyone else that a member joined
-    await room.broadcast({
-        "type": "MEMBER_JOINED",
-        "member": room.members[account_id],
-        "members": list(room.members.values()),
-    }, exclude_account_id=account_id)
-
-    # 5. Event loop
+    # 4. Event loop
     try:
         while True:
             data_text = await websocket.receive_text()
@@ -333,98 +577,8 @@ async def handle_party_websocket(websocket: WebSocket, code: str, token: Optiona
                 continue
 
             event_type = msg.get("type")
-            cur_time = float(msg.get("time", room.state.time))
-
-            if event_type == "PLAY":
-                async with room.lock:
-                    room.state.isPlaying = True
-                    room.state.time = cur_time
-                    room.state.lastUpdated = int(time.time() * 1000)
-                await room.broadcast({
-                    "type": "PLAY",
-                    "time": cur_time,
-                    "senderId": account_id,
-                    "senderName": account["name"],
-                }, exclude_account_id=account_id)
-
-            elif event_type == "PAUSE":
-                async with room.lock:
-                    room.state.isPlaying = False
-                    room.state.time = cur_time
-                    room.state.lastUpdated = int(time.time() * 1000)
-                await room.broadcast({
-                    "type": "PAUSE",
-                    "time": cur_time,
-                    "senderId": account_id,
-                    "senderName": account["name"],
-                }, exclude_account_id=account_id)
-
-            elif event_type == "SEEK":
-                async with room.lock:
-                    room.state.time = cur_time
-                    room.state.lastUpdated = int(time.time() * 1000)
-                await room.broadcast({
-                    "type": "SEEK",
-                    "time": cur_time,
-                    "senderId": account_id,
-                    "senderName": account["name"],
-                }, exclude_account_id=account_id)
-
-            elif event_type == "SYNC_TICK":
-                if account_id == room.host_id:
-                    async with room.lock:
-                        room.state.time = cur_time
-                        room.state.isPlaying = bool(msg.get("isPlaying", room.state.isPlaying))
-                        room.state.lastUpdated = int(time.time() * 1000)
-                    await room.broadcast({
-                        "type": "SYNC_TICK",
-                        "time": cur_time,
-                        "isPlaying": room.state.isPlaying,
-                        "timestamp": room.state.lastUpdated,
-                    }, exclude_account_id=account_id)
-
-            elif event_type in ("CHANGE_MEDIA", "MEDIA_CHANGED"):
-                new_media_raw = msg.get("media")
-                if new_media_raw:
-                    try:
-                        new_media = MediaPayload(**new_media_raw)
-                        time_val = float(msg.get("time", 0.0))
-                        async with room.lock:
-                            room.media = new_media
-                            room.state.time = time_val
-                            room.state.isPlaying = False
-                            room.state.lastUpdated = int(time.time() * 1000)
-                        await room.broadcast({
-                            "type": "CHANGE_MEDIA",
-                            "media": new_media.model_dump(),
-                            "time": time_val,
-                            "senderId": account_id,
-                            "senderName": account["name"],
-                        })
-                    except Exception as exc:
-                        log.warning("Invalid media payload: %s", exc)
-
-            elif event_type == "CHAT":
-                text = str(msg.get("text", "")).strip()[:500]
-                if text:
-                    chat_msg = {
-                        "id": f"{int(time.time() * 1000)}-{secrets.token_hex(4)}",
-                        "type": "CHAT",
-                        "text": text,
-                        "timestamp": int(time.time() * 1000),
-                        "sender": {
-                            "id": account_id,
-                            "name": account["name"],
-                            "color": account.get("color", "#6366f1"),
-                            "profilePicture": account.get("profile_picture"),
-                        },
-                    }
-                    async with room.lock:
-                        room.chat_history.append(chat_msg)
-                        if len(room.chat_history) > 100:
-                            room.chat_history.pop(0)
-                    # Broadcast to everyone including the sender
-                    await room.broadcast(chat_msg)
+            exclude_ws = account_id if event_type in ("PLAY", "PAUSE", "SEEK", "SYNC_TICK") else None
+            await apply_room_event(room, account, msg, exclude_ws_account_id=exclude_ws)
 
     except WebSocketDisconnect:
         pass
@@ -436,8 +590,9 @@ async def handle_party_websocket(websocket: WebSocket, code: str, token: Optiona
                 room.connections[account_id].discard(websocket)
                 if not room.connections[account_id]:
                     del room.connections[account_id]
-                    # If other members remain connected, update member list
-                    if room.connections:
+                    # Only remove from members if not active via HTTP
+                    has_recent_http = (time.time() - room.member_last_seen.get(account_id, 0)) < 30.0
+                    if not has_recent_http and len(room.members) > 1:
                         room.members.pop(account_id, None)
 
             # If host disconnected and other active connections exist, elect new host
@@ -455,7 +610,7 @@ async def handle_party_websocket(websocket: WebSocket, code: str, token: Optiona
                             "members": list(room.members.values()),
                         })
 
-        log.info("User %s disconnected from party %s", account["name"], clean_code)
+        log.info("User %s disconnected from party %s WebSocket", account["name"], clean_code)
 
         # Notify remaining members
         await room.broadcast({
