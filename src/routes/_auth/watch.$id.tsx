@@ -236,10 +236,16 @@ function WatchPage() {
   const [partyDialogOpen, setPartyDialogOpen] = useState(Boolean(searchPartyCode));
   const [isLocalPlaying, setIsLocalPlaying] = useState(false);
   const [vixsrcStartAt, setVixsrcStartAt] = useState<number | null>(null);
+  const [vixsrcAutoplay, setVixsrcAutoplay] = useState<boolean | undefined>(undefined);
+  // Incremented to force the iframe to fully remount when remote sync requires a reload
+  const [vixsrcIframeKey, setVixsrcIframeKey] = useState(0);
 
   const hlsPlayerRef = useRef<HlsPlayerHandle>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const lastBroadcastMediaRef = useRef<string>("");
+  // Timestamp of the last remote-triggered iframe reload (ms). Events fired by the
+  // newly loaded player within 5 s of this timestamp should not be re-broadcast.
+  const lastRemoteReloadRef = useRef<number>(0);
 
   useEffect(() => {
     if (searchPartyCode) {
@@ -264,17 +270,20 @@ function WatchPage() {
   const onRemotePlay = useCallback(
     (time: number) => {
       setIsLocalPlaying(true);
-      const cur = latestSecondsRef.current ?? 0;
       latestSecondsRef.current = time;
       if (playlistUrl && !hlsFailed) {
         hlsPlayerRef.current?.seek(time);
         hlsPlayerRef.current?.play();
       } else {
-        sendIframePlayerCommand(iframeRef.current, "play");
-        if (Math.abs(cur - time) > 3) {
-          sendIframePlayerCommand(iframeRef.current, "seek", time);
-          setVixsrcStartAt(Math.floor(time));
-        }
+        // Vixsrc doesn't accept postMessage commands — reload the iframe at the
+        // correct position with autoplay=1 so it starts playing immediately.
+        // Throttle reloads to once per 4 s to avoid spamming from SYNC_TICK.
+        if (Date.now() - lastRemoteReloadRef.current < 4000) return;
+        const t = Math.floor(time);
+        lastRemoteReloadRef.current = Date.now();
+        setVixsrcStartAt(t);
+        setVixsrcAutoplay(true);
+        setVixsrcIframeKey((k) => k + 1);
       }
     },
     [playlistUrl, hlsFailed],
@@ -287,7 +296,14 @@ function WatchPage() {
       if (playlistUrl && !hlsFailed) {
         hlsPlayerRef.current?.pause();
       } else {
-        sendIframePlayerCommand(iframeRef.current, "pause");
+        // Reload the iframe with autoplay=0 so it loads paused at the right position.
+        // Throttle reloads to once per 4 s to avoid spamming from SYNC_TICK.
+        if (Date.now() - lastRemoteReloadRef.current < 4000) return;
+        const t = Math.floor(time);
+        lastRemoteReloadRef.current = Date.now();
+        setVixsrcStartAt(t);
+        setVixsrcAutoplay(false);
+        setVixsrcIframeKey((k) => k + 1);
       }
     },
     [playlistUrl, hlsFailed],
@@ -300,9 +316,14 @@ function WatchPage() {
       if (playlistUrl && !hlsFailed) {
         hlsPlayerRef.current?.seek(time);
       } else {
-        sendIframePlayerCommand(iframeRef.current, "seek", time);
-        if (Math.abs(cur - time) > 3) {
-          setVixsrcStartAt(Math.floor(time));
+        // Only reload for seeks far from current position to avoid unnecessary reloads.
+        // Throttle reloads to once per 4 s to avoid spamming from SYNC_TICK.
+        if (Math.abs(cur - time) > 3 && Date.now() - lastRemoteReloadRef.current >= 4000) {
+          const t = Math.floor(time);
+          lastRemoteReloadRef.current = Date.now();
+          setVixsrcStartAt(t);
+          // Keep current autoplay state (don't change play/pause)
+          setVixsrcIframeKey((k) => k + 1);
         }
       }
     },
@@ -586,6 +607,7 @@ function WatchPage() {
           season: activeSeason?.number,
           episode: activeEpisode?.number,
           startAt: startSecond,
+          autoplay: vixsrcAutoplay,
         })
       : null;
 
@@ -754,7 +776,10 @@ function WatchPage() {
             setIsLocalPlaying(false);
             const curSec = latestSecondsRef.current ?? 0;
             persistMarker(curSec, true);
-            if (!party.isRemoteSyncingRef.current && party.room) {
+            const suppressBroadcast =
+              party.isRemoteSyncingRef.current ||
+              Date.now() - lastRemoteReloadRef.current < 5000;
+            if (!suppressBroadcast && party.room) {
               party.sendPause(curSec);
             }
             return;
@@ -762,7 +787,10 @@ function WatchPage() {
           if (lower === "play" || lower === "playing" || lower === "start") {
             setIsLocalPlaying(true);
             const curSec = latestSecondsRef.current ?? 0;
-            if (!party.isRemoteSyncingRef.current && party.room) {
+            const suppressBroadcast =
+              party.isRemoteSyncingRef.current ||
+              Date.now() - lastRemoteReloadRef.current < 5000;
+            if (!suppressBroadcast && party.room) {
               party.sendPlay(curSec);
             }
             return;
@@ -770,7 +798,10 @@ function WatchPage() {
           if (lower === "seeking" || lower === "seek" || lower === "seeked") {
             const curSec = latestSecondsRef.current ?? 0;
             persistMarker(curSec, true);
-            if (!party.isRemoteSyncingRef.current && party.room) {
+            const suppressBroadcast =
+              party.isRemoteSyncingRef.current ||
+              Date.now() - lastRemoteReloadRef.current < 5000;
+            if (!suppressBroadcast && party.room) {
               party.sendSeek(curSec);
             }
             return;
@@ -891,7 +922,10 @@ function WatchPage() {
         const curSec = seconds ?? latestSecondsRef.current ?? 0;
         latestSecondsRef.current = curSec;
         persistMarker(curSec, true);
-        if (!party.isRemoteSyncingRef.current && party.room) {
+        const suppressBroadcast =
+          party.isRemoteSyncingRef.current ||
+          Date.now() - lastRemoteReloadRef.current < 5000;
+        if (!suppressBroadcast && party.room) {
           party.sendSeek(curSec);
         }
         return;
@@ -903,7 +937,10 @@ function WatchPage() {
         const curSec = seconds ?? latestSecondsRef.current ?? 0;
         latestSecondsRef.current = curSec;
         persistMarker(curSec, true);
-        if (!party.isRemoteSyncingRef.current && party.room) {
+        const suppressBroadcast =
+          party.isRemoteSyncingRef.current ||
+          Date.now() - lastRemoteReloadRef.current < 5000;
+        if (!suppressBroadcast && party.room) {
           party.sendPause(curSec);
         }
         return;
@@ -914,7 +951,10 @@ function WatchPage() {
         setIsLocalPlaying(true);
         const curSec = seconds ?? latestSecondsRef.current ?? 0;
         latestSecondsRef.current = curSec;
-        if (!party.isRemoteSyncingRef.current && party.room) {
+        const suppressBroadcast =
+          party.isRemoteSyncingRef.current ||
+          Date.now() - lastRemoteReloadRef.current < 5000;
+        if (!suppressBroadcast && party.room) {
           party.sendPlay(curSec);
         }
         return;
@@ -1054,6 +1094,7 @@ function WatchPage() {
           {adBlockPrompt.shouldShow ? <AdBlockPrompt browser={adBlockPrompt.info.browser} /> : null}
           <div className="aspect-video w-full overflow-hidden rounded-xl border border-border bg-black">
             <iframe
+              key={vixsrcIframeKey}
               ref={iframeRef}
               src={resumeEmbedUrl ?? embedUrl}
               title={`${title.name} player`}

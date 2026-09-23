@@ -6,6 +6,8 @@ export interface EmbedTarget {
   season?: number | undefined;
   episode?: number | undefined;
   startAt?: number | undefined;
+  /** When provided, appends ?autoplay=1 or ?autoplay=0 to force playback state on load */
+  autoplay?: boolean | undefined;
 }
 
 /**
@@ -28,6 +30,9 @@ export function buildEmbedUrl(config: PlayerConfig, target: EmbedTarget): string
   const url = new URL(path, `https://${host}`);
   if (target.startAt !== undefined && target.startAt > 0) {
     url.searchParams.set("startAt", String(Math.floor(target.startAt)));
+  }
+  if (target.autoplay !== undefined) {
+    url.searchParams.set("autoplay", target.autoplay ? "1" : "0");
   }
   return url.toString();
 }
