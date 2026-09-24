@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, createFileRoute, notFound } from "@tanstack/react-router";
 import { queryOptions, useQuery, useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
-import { ArrowLeft, Loader2, Users } from "lucide-react";
+import { ArrowLeft, Loader2, Pause, Play, Users } from "lucide-react";
 import { z } from "zod";
 
 import { HlsPlayer, type HlsPlayerHandle } from "@/components/HlsPlayer";
@@ -253,19 +253,17 @@ function WatchPage() {
         hlsPlayerRef.current?.play();
       } else {
         const cur = latestSecondsRef.current ?? 0;
-        // If already playing at approximately the same time (< 4s), avoid redundant reload
-        if (isLocalPlaying && Math.abs(cur - time) < 4) {
-          return;
-        }
-        if (Date.now() - lastRemoteReloadRef.current < 2500) return;
         setIsLocalPlaying(true);
         remoteActionRef.current = { type: "play", ts: Date.now() };
         latestSecondsRef.current = time;
-        lastRemoteReloadRef.current = Date.now();
-        reloadVixsrc(time, true);
+        // Avoid redundant reload if already approximately at that time (< 5s)
+        if (Math.abs(cur - time) > 5 && Date.now() - lastRemoteReloadRef.current >= 3000) {
+          lastRemoteReloadRef.current = Date.now();
+          reloadVixsrc(time, true);
+        }
       }
     },
-    [playlistUrl, hlsFailed, isLocalPlaying, reloadVixsrc],
+    [playlistUrl, hlsFailed, reloadVixsrc],
   );
 
   const onRemotePause = useCallback(
@@ -275,20 +273,13 @@ function WatchPage() {
         latestSecondsRef.current = time;
         hlsPlayerRef.current?.pause();
       } else {
-        const cur = latestSecondsRef.current ?? 0;
-        // If already paused at approximately the same time (< 4s), avoid redundant reload
-        if (!isLocalPlaying && Math.abs(cur - time) < 4) {
-          return;
-        }
-        if (Date.now() - lastRemoteReloadRef.current < 2500) return;
         setIsLocalPlaying(false);
-        remoteActionRef.current = { type: "pause", ts: Date.now() };
         latestSecondsRef.current = time;
-        lastRemoteReloadRef.current = Date.now();
-        reloadVixsrc(time, false);
+        remoteActionRef.current = { type: "pause", ts: Date.now() };
+        // DO NOT reload Vixsrc iframe on pause: reloading with startAt forces JWPlayer to auto-play and loop.
       }
     },
-    [playlistUrl, hlsFailed, isLocalPlaying, reloadVixsrc],
+    [playlistUrl, hlsFailed],
   );
 
   const onRemoteSeek = useCallback(
@@ -299,8 +290,8 @@ function WatchPage() {
         hlsPlayerRef.current?.seek(time);
       } else {
         remoteActionRef.current = { type: "seek", ts: Date.now() };
-        // Only reload for meaningful seeks (> 6s) and throttle to once per 2.5s
-        if (Math.abs(cur - time) > 6 && Date.now() - lastRemoteReloadRef.current >= 2500) {
+        // Only reload for meaningful seeks (> 8s) and throttle to once per 3s
+        if (Math.abs(cur - time) > 8 && Date.now() - lastRemoteReloadRef.current >= 3000) {
           lastRemoteReloadRef.current = Date.now();
           reloadVixsrc(time, isLocalPlaying);
         }
@@ -518,8 +509,8 @@ function WatchPage() {
       }
 
       party.setRoom(res.room);
-      if (res.room.state?.time && res.room.state.time > 0) {
-        reloadVixsrc(res.room.state.time, res.room.state.isPlaying);
+      if (res.room.state?.time && res.room.state.time > 0 && res.room.state.isPlaying && !playlistUrl) {
+        reloadVixsrc(res.room.state.time, true);
       }
       const targetMedia = res.room.media;
       if (targetMedia && targetMedia.slug) {
@@ -787,14 +778,18 @@ function WatchPage() {
             return;
           }
           if (lower === "play" || lower === "playing" || lower === "start") {
+            const isRemotePaused = Boolean(party.room && !party.room.state.isPlaying);
+            const isSuppressed =
+              party.isRemoteSyncingRef.current ||
+              Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS ||
+              (remoteActionRef.current.type === "pause" && Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS);
+            if (isRemotePaused && isSuppressed) {
+              return;
+            }
             setIsLocalPlaying(true);
             const curSec = latestSecondsRef.current ?? 0;
             latestSecondsRef.current = curSec;
-            const suppressBroadcast =
-              party.isRemoteSyncingRef.current ||
-              Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS ||
-              (remoteActionRef.current.type === "play" && Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS);
-            if (!suppressBroadcast && party.room) {
+            if (!isSuppressed && party.room) {
               party.sendPlay(curSec);
             }
             return;
@@ -955,14 +950,20 @@ function WatchPage() {
 
       // Handle play events
       if (eventName === "play" || eventName === "playing" || eventName === "start") {
+        const isRemotePaused = Boolean(party.room && !party.room.state.isPlaying);
+        const isSuppressed =
+          party.isRemoteSyncingRef.current ||
+          Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS ||
+          (remoteActionRef.current.type === "pause" && Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS);
+
+        if (isRemotePaused && isSuppressed) {
+          return;
+        }
+
         setIsLocalPlaying(true);
         const curSec = seconds ?? latestSecondsRef.current ?? 0;
         latestSecondsRef.current = curSec;
-        const suppressBroadcast =
-          party.isRemoteSyncingRef.current ||
-          Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS ||
-          (remoteActionRef.current.type === "play" && Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS);
-        if (!suppressBroadcast && party.room) {
+        if (!isSuppressed && party.room) {
           party.sendPlay(curSec);
         }
         return;
@@ -1087,7 +1088,11 @@ function WatchPage() {
                 party.sendSeek(sec);
               }
             }}
-            initialSeconds={marker ?? undefined}
+            initialSeconds={
+              party.room?.state?.time && party.room.state.time > 0
+                ? party.room.state.time
+                : (marker ?? undefined)
+            }
           />
         </div>
       ) : streamQuery.isLoading || !markerLoaded ? (
@@ -1100,7 +1105,7 @@ function WatchPage() {
             <p className="text-xs text-muted-foreground">{t("watch_unavailable")}</p>
           ) : null}
           {adBlockPrompt.shouldShow ? <AdBlockPrompt browser={adBlockPrompt.info.browser} /> : null}
-          <div className="aspect-video w-full overflow-hidden rounded-xl border border-border bg-black">
+          <div className="relative aspect-video w-full overflow-hidden rounded-xl border border-border bg-black">
             <iframe
               key={vixsrcIframeKey}
               ref={iframeRef}
@@ -1110,6 +1115,33 @@ function WatchPage() {
               allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
               referrerPolicy="origin"
             />
+            {party.room && !isLocalPlaying && (
+              <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/75 backdrop-blur-[2px] transition-all">
+                <div className="flex flex-col items-center gap-3 rounded-xl border border-border/80 bg-card/95 p-6 text-center shadow-2xl max-w-sm mx-4">
+                  <div className="rounded-full bg-primary/10 p-3 text-primary">
+                    <Pause className="size-6 animate-pulse" />
+                  </div>
+                  <div className="space-y-1">
+                    <h3 className="text-base font-semibold text-foreground">Riproduzione in pausa</h3>
+                    <p className="text-xs text-muted-foreground">
+                      La stanza è in pausa. Clicca play per riprendere la visione insieme.
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    className="gap-2 mt-1"
+                    onClick={() => {
+                      const cur = latestSecondsRef.current ?? party.room?.state?.time ?? 0;
+                      setIsLocalPlaying(true);
+                      party.sendPlay(cur);
+                    }}
+                  >
+                    <Play className="size-4 fill-current" />
+                    Riprendi insieme
+                  </Button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       ) : (
