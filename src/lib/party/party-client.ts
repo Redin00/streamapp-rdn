@@ -691,13 +691,15 @@ export function useWatchParty({
 
             if (playStateMismatch || diff > 3.0) {
               withRemoteSync(() => {
-                if (diff > 3.0 && onRemoteSeekRef.current) {
-                  onRemoteSeekRef.current(msg.time);
-                }
-                if (msg.isPlaying && onRemotePlayRef.current) {
-                  onRemotePlayRef.current(msg.time);
-                } else if (!msg.isPlaying && onRemotePauseRef.current) {
-                  onRemotePauseRef.current(msg.time);
+                if (msg.isPlaying) {
+                  if (onRemotePlayRef.current) onRemotePlayRef.current(msg.time);
+                } else {
+                  if (diff > 3.0 && onRemoteSeekRef.current) {
+                    onRemoteSeekRef.current(msg.time);
+                  }
+                  if (onRemotePauseRef.current) {
+                    onRemotePauseRef.current(msg.time);
+                  }
                 }
               }, 1200);
             }

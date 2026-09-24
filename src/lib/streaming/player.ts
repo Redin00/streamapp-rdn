@@ -32,7 +32,7 @@ export function buildEmbedUrl(config: PlayerConfig, target: EmbedTarget): string
     url.searchParams.set("startAt", String(Math.floor(target.startAt)));
   }
   if (target.autoplay !== undefined) {
-    url.searchParams.set("autoplay", target.autoplay ? "1" : "0");
+    url.searchParams.set("autoplay", target.autoplay ? "true" : "false");
   }
   return url.toString();
 }
