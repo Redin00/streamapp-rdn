@@ -59,62 +59,6 @@ interface PlayerMessagePayload {
   value?: number | undefined;
 }
 
-function sendIframePlayerCommand(
-  iframe: HTMLIFrameElement | null,
-  command: "play" | "pause" | "seek",
-  time?: number,
-) {
-  if (!iframe || !iframe.contentWindow) return;
-  const cw = iframe.contentWindow;
-
-  if (command === "seek" && typeof time === "number") {
-    const rounded = Math.floor(time * 10) / 10;
-    cw.postMessage({ type: "seek", time: rounded }, "*");
-    cw.postMessage({ method: "seek", value: rounded }, "*");
-    cw.postMessage({ event: "seek", time: rounded }, "*");
-    cw.postMessage({ action: "seek", value: rounded, time: rounded }, "*");
-    cw.postMessage({ action: "start", value: rounded, time: rounded }, "*");
-    cw.postMessage({ api: "seek", time: rounded }, "*");
-    cw.postMessage(`seek:${rounded}`, "*");
-    cw.postMessage(`start:${rounded}`, "*");
-    try {
-      cw.postMessage(JSON.stringify({ type: "seek", time: rounded }), "*");
-      cw.postMessage(JSON.stringify({ method: "seek", value: rounded }), "*");
-      cw.postMessage(JSON.stringify({ event: "seek", time: rounded }), "*");
-      cw.postMessage(JSON.stringify({ action: "seek", value: rounded }), "*");
-      cw.postMessage(JSON.stringify({ action: "start", value: rounded }), "*");
-      cw.postMessage(JSON.stringify({ event: "command", func: "seekTo", args: [rounded, true] }), "*");
-    } catch {}
-  } else if (command === "play") {
-    cw.postMessage({ type: "play" }, "*");
-    cw.postMessage({ method: "play" }, "*");
-    cw.postMessage({ event: "play" }, "*");
-    cw.postMessage({ action: "play" }, "*");
-    cw.postMessage({ api: "play" }, "*");
-    cw.postMessage("play", "*");
-    try {
-      cw.postMessage(JSON.stringify({ type: "play" }), "*");
-      cw.postMessage(JSON.stringify({ method: "play" }), "*");
-      cw.postMessage(JSON.stringify({ event: "play" }), "*");
-      cw.postMessage(JSON.stringify({ action: "play" }), "*");
-      cw.postMessage(JSON.stringify({ event: "command", func: "playVideo", args: "" }), "*");
-    } catch {}
-  } else if (command === "pause") {
-    cw.postMessage({ type: "pause" }, "*");
-    cw.postMessage({ method: "pause" }, "*");
-    cw.postMessage({ event: "pause" }, "*");
-    cw.postMessage({ action: "pause" }, "*");
-    cw.postMessage({ api: "pause" }, "*");
-    cw.postMessage("pause", "*");
-    try {
-      cw.postMessage(JSON.stringify({ type: "pause" }), "*");
-      cw.postMessage(JSON.stringify({ method: "pause" }), "*");
-      cw.postMessage(JSON.stringify({ event: "pause" }), "*");
-      cw.postMessage(JSON.stringify({ action: "pause" }), "*");
-      cw.postMessage(JSON.stringify({ event: "command", func: "pauseVideo", args: "" }), "*");
-    } catch {}
-  }
-}
 
 export const Route = createFileRoute("/_auth/watch/$id")({
   validateSearch: (search: Record<string, unknown>) => {
@@ -235,22 +179,52 @@ function WatchPage() {
   const [isCreatingParty, setIsCreatingParty] = useState(false);
   const [partyDialogOpen, setPartyDialogOpen] = useState(Boolean(searchPartyCode));
   const [isLocalPlaying, setIsLocalPlaying] = useState(false);
-  const [vixsrcStartAt, setVixsrcStartAt] = useState<number | null>(null);
-  const [vixsrcAutoplay, setVixsrcAutoplay] = useState<boolean | undefined>(undefined);
+  const [vixsrcEmbedUrl, setVixsrcEmbedUrl] = useState<string | null>(null);
   // Incremented to force the iframe to fully remount when remote sync requires a reload
   const [vixsrcIframeKey, setVixsrcIframeKey] = useState(0);
-const REMOTE_SUPPRESS_MS = 8000; // ms, covers iframe reload latency and remote action window
+  const REMOTE_SUPPRESS_MS = 8000; // ms, covers iframe reload latency and remote action window
 
   const hlsPlayerRef = useRef<HlsPlayerHandle>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const lastBroadcastMediaRef = useRef<string>("");
   // Timestamp of the last remote-triggered iframe reload (ms). Events fired by the
-  // newly loaded player within 5 s of this timestamp should not be re-broadcast.
-  // Tracks the last remote‑initiated action to suppress rebroadcast of the iframe's own events
+  // newly loaded player within REMOTE_SUPPRESS_MS of this timestamp will not be re-broadcast.
   const remoteActionRef = useRef<{ type: string | null; ts: number }>({ type: null, ts: 0 });
   const lastRemoteReloadRef = useRef<number>(0);
 
+  // Helper to safely re-generate the iframe embed URL and remount the iframe for Vixsrc
+  const reloadVixsrc = useCallback(
+    (startAt?: number, autoplay?: boolean) => {
+      if (!title?.tmdbId || !player) return;
+      const targetTime =
+        typeof startAt === "number" && Number.isFinite(startAt) && startAt > 0
+          ? Math.floor(startAt)
+          : undefined;
+      const nextUrl = buildEmbedUrl(player, {
+        tmdbId: title.tmdbId,
+        type: title.type,
+        season: activeSeason?.number,
+        episode: activeEpisode?.number,
+        startAt: targetTime,
+        autoplay,
+      });
+      if (nextUrl) {
+        setVixsrcEmbedUrl(nextUrl);
+        setVixsrcIframeKey((k) => k + 1);
+      }
+    },
+    [title, player, activeSeason?.number, activeEpisode?.number],
+  );
+
+  const isLeavingPartyRef = useRef(false);
+
   useEffect(() => {
+    if (isLeavingPartyRef.current) {
+      if (!searchPartyCode) {
+        isLeavingPartyRef.current = false;
+      }
+      return;
+    }
     if (searchPartyCode) {
       const clean = searchPartyCode.trim().toUpperCase();
       if (clean !== partyCode) {
@@ -272,46 +246,49 @@ const REMOTE_SUPPRESS_MS = 8000; // ms, covers iframe reload latency and remote 
 
   const onRemotePlay = useCallback(
     (time: number) => {
-      setIsLocalPlaying(true);
-      remoteActionRef.current = { type: "play", ts: Date.now() };
-      latestSecondsRef.current = time;
       if (playlistUrl && !hlsFailed) {
+        setIsLocalPlaying(true);
+        latestSecondsRef.current = time;
         hlsPlayerRef.current?.seek(time);
         hlsPlayerRef.current?.play();
       } else {
-        // Vixsrc doesn't accept postMessage commands — reload the iframe at the
-        // correct position with autoplay=1 so it starts playing immediately.
-        // Throttle reloads to once per 4 s to avoid spamming from SYNC_TICK.
-        if (Date.now() - lastRemoteReloadRef.current < 4000) return;
-        const t = Math.floor(time);
+        const cur = latestSecondsRef.current ?? 0;
+        // If already playing at approximately the same time (< 4s), avoid redundant reload
+        if (isLocalPlaying && Math.abs(cur - time) < 4) {
+          return;
+        }
+        if (Date.now() - lastRemoteReloadRef.current < 2500) return;
+        setIsLocalPlaying(true);
+        remoteActionRef.current = { type: "play", ts: Date.now() };
+        latestSecondsRef.current = time;
         lastRemoteReloadRef.current = Date.now();
-        setVixsrcStartAt(t);
-        setVixsrcAutoplay(true);
-        setVixsrcIframeKey((k) => k + 1);
+        reloadVixsrc(time, true);
       }
     },
-    [playlistUrl, hlsFailed],
+    [playlistUrl, hlsFailed, isLocalPlaying, reloadVixsrc],
   );
 
   const onRemotePause = useCallback(
     (time: number) => {
-      setIsLocalPlaying(false);
-      remoteActionRef.current = { type: "pause", ts: Date.now() };
-      latestSecondsRef.current = time;
       if (playlistUrl && !hlsFailed) {
+        setIsLocalPlaying(false);
+        latestSecondsRef.current = time;
         hlsPlayerRef.current?.pause();
       } else {
-        // Reload the iframe with autoplay=0 so it loads paused at the right position.
-        // Throttle reloads to once per 4 s to avoid spamming from SYNC_TICK.
-        if (Date.now() - lastRemoteReloadRef.current < 4000) return;
-        const t = Math.floor(time);
+        const cur = latestSecondsRef.current ?? 0;
+        // If already paused at approximately the same time (< 4s), avoid redundant reload
+        if (!isLocalPlaying && Math.abs(cur - time) < 4) {
+          return;
+        }
+        if (Date.now() - lastRemoteReloadRef.current < 2500) return;
+        setIsLocalPlaying(false);
+        remoteActionRef.current = { type: "pause", ts: Date.now() };
+        latestSecondsRef.current = time;
         lastRemoteReloadRef.current = Date.now();
-        setVixsrcStartAt(t);
-        setVixsrcAutoplay(false);
-        setVixsrcIframeKey((k) => k + 1);
+        reloadVixsrc(time, false);
       }
     },
-    [playlistUrl, hlsFailed],
+    [playlistUrl, hlsFailed, isLocalPlaying, reloadVixsrc],
   );
 
   const onRemoteSeek = useCallback(
@@ -321,20 +298,15 @@ const REMOTE_SUPPRESS_MS = 8000; // ms, covers iframe reload latency and remote 
       if (playlistUrl && !hlsFailed) {
         hlsPlayerRef.current?.seek(time);
       } else {
-        // Record remote seek action to suppress subsequent broadcast
         remoteActionRef.current = { type: "seek", ts: Date.now() };
-        // Only reload for seeks far from current position to avoid unnecessary reloads.
-        // Throttle reloads to once per 4 s to avoid spamming from SYNC_TICK.
-        if (Math.abs(cur - time) > 3 && Date.now() - lastRemoteReloadRef.current >= 4000) {
-          const t = Math.floor(time);
+        // Only reload for meaningful seeks (> 6s) and throttle to once per 2.5s
+        if (Math.abs(cur - time) > 6 && Date.now() - lastRemoteReloadRef.current >= 2500) {
           lastRemoteReloadRef.current = Date.now();
-          setVixsrcStartAt(t);
-          // Keep current autoplay state (don't change play/pause)
-          setVixsrcIframeKey((k) => k + 1);
+          reloadVixsrc(time, isLocalPlaying);
         }
       }
     },
-    [playlistUrl, hlsFailed],
+    [playlistUrl, hlsFailed, isLocalPlaying, reloadVixsrc],
   );
 
   const onRemoteMediaChange = useCallback(
@@ -547,7 +519,7 @@ const REMOTE_SUPPRESS_MS = 8000; // ms, covers iframe reload latency and remote 
 
       party.setRoom(res.room);
       if (res.room.state?.time && res.room.state.time > 0) {
-        setVixsrcStartAt(Math.floor(res.room.state.time));
+        reloadVixsrc(res.room.state.time, res.room.state.isPlaying);
       }
       const targetMedia = res.room.media;
       if (targetMedia && targetMedia.slug) {
@@ -588,7 +560,8 @@ const REMOTE_SUPPRESS_MS = 8000; // ms, covers iframe reload latency and remote 
     });
   };
 
-  const handleLeaveParty = () => {
+  const handleLeaveParty = useCallback(() => {
+    isLeavingPartyRef.current = true;
     try {
       sessionStorage.removeItem("cinemagic_watch_party");
     } catch {}
@@ -604,20 +577,37 @@ const REMOTE_SUPPRESS_MS = 8000; // ms, covers iframe reload latency and remote 
       }),
       replace: true,
     });
-  };
+  }, [id, navigate, party]);
 
-  const startSecond = vixsrcStartAt ?? party.room?.state?.time ?? marker ?? undefined;
-  const resumeEmbedUrl =
-    embedUrl && title?.tmdbId
-      ? buildEmbedUrl(player, {
-          tmdbId: title.tmdbId,
-          type: title.type,
-          season: activeSeason?.number,
-          episode: activeEpisode?.number,
-          startAt: startSecond,
-          autoplay: vixsrcAutoplay,
-        })
-      : null;
+  // Initialize Vixsrc iframe URL once when media or marker is ready
+  const initialVixsrcLoadedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!title?.tmdbId || !player || !markerLoaded) return;
+    const mediaKey = `${slug}:${season}:${episode}`;
+    if (initialVixsrcLoadedRef.current === mediaKey) return;
+    // If waiting for party room to load from URL search param, wait until party.room is loaded
+    if (searchPartyCode && !party.room && !party.error) return;
+
+    initialVixsrcLoadedRef.current = mediaKey;
+    const initialStart =
+      party.room?.state?.time && party.room.state.time > 0
+        ? party.room.state.time
+        : (marker ?? undefined);
+    const initialAutoplay = party.room ? party.room.state.isPlaying : undefined;
+    reloadVixsrc(initialStart, initialAutoplay);
+  }, [
+    title?.tmdbId,
+    player,
+    markerLoaded,
+    slug,
+    season,
+    episode,
+    searchPartyCode,
+    party.room,
+    party.error,
+    marker,
+    reloadVixsrc,
+  ]);
 
   // Load the marker from the server first; fall back to a localStorage copy
   // that was saved as a cross-session safety net when the service was down.
@@ -1114,7 +1104,7 @@ const REMOTE_SUPPRESS_MS = 8000; // ms, covers iframe reload latency and remote 
             <iframe
               key={vixsrcIframeKey}
               ref={iframeRef}
-              src={resumeEmbedUrl ?? embedUrl}
+              src={vixsrcEmbedUrl ?? embedUrl}
               title={`${title.name} player`}
               className="size-full"
               allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
