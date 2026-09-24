@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import unittest
 from unittest.mock import patch
 
@@ -275,6 +276,7 @@ class TestWatchParty(unittest.TestCase):
 
             # 3. User 1 sends PAUSE via WebSocket
             ws.send_json({"type": "PAUSE", "time": 20.0})
+            time.sleep(0.05)
 
             # 4. User 2 polls via HTTP and sees PAUSE
             poll = self.client.get(f"/party/{code}/poll?since={msg2['timestamp']}", headers=self.headers2)

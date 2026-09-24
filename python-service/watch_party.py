@@ -336,7 +336,11 @@ async def apply_room_event(
     account_id = account["id"]
     room.touch(account_id)
     event_type = msg.get("type")
-    cur_time = float(msg.get("time", room.state.time))
+    raw_time = msg.get("time")
+    try:
+        cur_time = float(raw_time) if (raw_time is not None and raw_time != "") else float(room.state.time)
+    except (ValueError, TypeError):
+        cur_time = float(room.state.time)
 
     if event_type == "PLAY":
         async with room.lock:

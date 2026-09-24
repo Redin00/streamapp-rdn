@@ -41,6 +41,7 @@ interface PlayerEventData {
   time?: number | undefined;
   seconds?: number | undefined;
   position?: number | undefined;
+  offset?: number | undefined;
   value?: number | undefined;
   video_id?: string | undefined;
 }
@@ -182,7 +183,7 @@ function WatchPage() {
   const [vixsrcEmbedUrl, setVixsrcEmbedUrl] = useState<string | null>(null);
   // Incremented to force the iframe to fully remount when remote sync requires a reload
   const [vixsrcIframeKey, setVixsrcIframeKey] = useState(0);
-  const REMOTE_SUPPRESS_MS = 8000; // ms, covers iframe reload latency and remote action window
+  const REMOTE_SUPPRESS_MS = 2500; // ms, covers iframe reload latency and remote action window
 
   const hlsPlayerRef = useRef<HlsPlayerHandle>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
@@ -284,14 +285,15 @@ function WatchPage() {
 
   const onRemoteSeek = useCallback(
     (time: number) => {
+      if (!Number.isFinite(time) || time < 0) return;
       const cur = latestSecondsRef.current ?? 0;
       latestSecondsRef.current = time;
       if (playlistUrl && !hlsFailed) {
         hlsPlayerRef.current?.seek(time);
       } else {
         remoteActionRef.current = { type: "seek", ts: Date.now() };
-        // Only reload for meaningful seeks (> 8s) and throttle to once per 3s
-        if (Math.abs(cur - time) > 8 && Date.now() - lastRemoteReloadRef.current >= 3000) {
+        // Reload Vixsrc to seek to the new position if difference > 2 seconds
+        if (Math.abs(cur - time) > 2 && Date.now() - lastRemoteReloadRef.current >= 2000) {
           lastRemoteReloadRef.current = Date.now();
           reloadVixsrc(time, isLocalPlaying);
         }
@@ -831,11 +833,20 @@ function WatchPage() {
       let seconds: number | null = null;
       let totalDuration: number | null = null;
 
+      const toValidSeconds = (v: unknown): number | null => {
+        if (typeof v === "number" && Number.isFinite(v) && v >= 0) return v;
+        if (typeof v === "string") {
+          const p = parseFloat(v);
+          if (Number.isFinite(p) && p >= 0) return p;
+        }
+        return null;
+      };
+
       if (typeof record.event === "object" && record.event !== null) {
         const evObj = record.event;
         if (typeof evObj.event === "string") eventName = evObj.event.toLowerCase();
-        if (typeof evObj.currentTime === "number") seconds = evObj.currentTime;
-        if (typeof evObj.duration === "number") totalDuration = evObj.duration;
+        seconds = toValidSeconds(evObj.position) ?? toValidSeconds(evObj.currentTime) ?? toValidSeconds(evObj.offset);
+        totalDuration = toValidSeconds(evObj.duration);
       } else if (typeof record.event === "string") {
         eventName = record.event.toLowerCase();
       }
@@ -845,11 +856,11 @@ function WatchPage() {
         if (!eventName && typeof dataObj.event === "string") {
           eventName = dataObj.event.toLowerCase();
         }
-        if (seconds === null && typeof dataObj.currentTime === "number") {
-          seconds = dataObj.currentTime;
+        if (seconds === null) {
+          seconds = toValidSeconds(dataObj.position) ?? toValidSeconds(dataObj.currentTime) ?? toValidSeconds(dataObj.offset);
         }
-        if (totalDuration === null && typeof dataObj.duration === "number") {
-          totalDuration = dataObj.duration;
+        if (totalDuration === null) {
+          totalDuration = toValidSeconds(dataObj.duration);
         }
       }
 
@@ -862,22 +873,26 @@ function WatchPage() {
         const evAny = record.event as Record<string, unknown> | undefined;
         const dataAny = record.data as Record<string, unknown> | undefined;
         const candidates = [
-          record,
-          dataAny,
-          evAny,
           evAny && typeof evAny["data"] === "object" ? (evAny["data"] as Record<string, unknown>) : null,
           dataAny && typeof dataAny["data"] === "object" ? (dataAny["data"] as Record<string, unknown>) : null,
+          evAny,
+          dataAny,
+          record,
           record.info,
           record.payload,
         ];
         for (const cand of candidates) {
           if (cand && typeof cand === "object") {
             const c = cand as PlayerEventData;
-            const val = c.currentTime ?? c.time ?? c.seconds ?? c.position ?? c.value;
-            const num =
-              typeof val === "number" ? val : typeof val === "string" ? parseFloat(val) : NaN;
-            if (Number.isFinite(num) && num >= 0) {
-              seconds = num;
+            const valid =
+              toValidSeconds(c.position) ??
+              toValidSeconds(c.offset) ??
+              toValidSeconds(c.currentTime) ??
+              toValidSeconds(c.time) ??
+              toValidSeconds(c.seconds) ??
+              toValidSeconds(c.value);
+            if (valid !== null) {
+              seconds = valid;
               break;
             }
           }
@@ -890,11 +905,9 @@ function WatchPage() {
         for (const cand of candidates) {
           if (cand && typeof cand === "object") {
             const c = cand as PlayerEventData;
-            const val = c.duration;
-            const num =
-              typeof val === "number" ? val : typeof val === "string" ? parseFloat(val) : NaN;
-            if (Number.isFinite(num) && num > 0) {
-              totalDuration = num;
+            const valid = toValidSeconds(c.duration);
+            if (valid !== null && valid > 0) {
+              totalDuration = valid;
               break;
             }
           }
@@ -919,7 +932,8 @@ function WatchPage() {
 
       // Handle seek events (mouse drag/click on progress bar)
       if (eventName === "seeked" || eventName === "seek") {
-        const curSec = seconds ?? latestSecondsRef.current ?? 0;
+        const curSec = seconds ?? latestSecondsRef.current;
+        if (curSec === null || !Number.isFinite(curSec) || curSec < 0) return;
         latestSecondsRef.current = curSec;
         persistMarker(curSec, true);
         const suppressBroadcast =
@@ -936,13 +950,15 @@ function WatchPage() {
       if (eventName === "pause") {
         setIsLocalPlaying(false);
         const curSec = seconds ?? latestSecondsRef.current ?? 0;
-        latestSecondsRef.current = curSec;
-        persistMarker(curSec, true);
+        if (Number.isFinite(curSec) && curSec >= 0) {
+          latestSecondsRef.current = curSec;
+          persistMarker(curSec, true);
+        }
         const suppressBroadcast =
           party.isRemoteSyncingRef.current ||
           Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS ||
           (remoteActionRef.current.type === "pause" && Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS);
-        if (!suppressBroadcast && party.room) {
+        if (!suppressBroadcast && party.room && Number.isFinite(curSec)) {
           party.sendPause(curSec);
         }
         return;
