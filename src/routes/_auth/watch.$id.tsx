@@ -307,11 +307,9 @@ function WatchPage() {
         isLocalPlayingRef.current = false;
         latestSecondsRef.current = time;
         remoteActionRef.current = { type: "pause", ts: Date.now() };
-        // Reload with autoplay=false so playback stops, audio halts, and it sits paused at time
-        reloadVixsrc(time, false);
       }
     },
-    [playlistUrl, hlsFailed, reloadVixsrc],
+    [playlistUrl, hlsFailed],
   );
 
   const onRemoteSeek = useCallback(
@@ -617,6 +615,10 @@ function WatchPage() {
         ? party.room.state.time
         : (marker ?? undefined);
     const initialAutoplay = party.room ? party.room.state.isPlaying : undefined;
+    if (party.room) {
+      setIsLocalPlaying(party.room.state.isPlaying);
+      isLocalPlayingRef.current = party.room.state.isPlaying;
+    }
     reloadVixsrc(initialStart, initialAutoplay);
   }, [
     title?.tmdbId,
@@ -1138,9 +1140,6 @@ function WatchPage() {
                   setIsLocalPlaying(false);
                   isLocalPlayingRef.current = false;
                   party.sendPause(cur);
-                  if (!playlistUrl || hlsFailed) {
-                    reloadVixsrc(cur, false);
-                  }
                 } else {
                   setIsLocalPlaying(true);
                   isLocalPlayingRef.current = true;
@@ -1255,18 +1254,27 @@ function WatchPage() {
           ) : null}
           {adBlockPrompt.shouldShow ? <AdBlockPrompt browser={adBlockPrompt.info.browser} /> : null}
           <div className="relative aspect-video w-full overflow-hidden rounded-xl border border-border bg-black">
-            <iframe
-              key={vixsrcIframeKey}
-              ref={iframeRef}
-              src={vixsrcEmbedUrl ?? embedUrl}
-              title={`${title.name} player`}
-              className="size-full"
-              allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
-              referrerPolicy="origin"
-            />
+            {(!party.room || isLocalPlaying) && (
+              <iframe
+                key={vixsrcIframeKey}
+                ref={iframeRef}
+                src={vixsrcEmbedUrl ?? embedUrl}
+                title={`${title.name} player`}
+                className="size-full"
+                allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
+                referrerPolicy="origin"
+              />
+            )}
             {party.room && !isLocalPlaying && (
-              <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/75 backdrop-blur-[2px] transition-all">
-                <div className="flex flex-col items-center gap-3 rounded-xl border border-border/80 bg-card/95 p-6 text-center shadow-2xl max-w-sm mx-4">
+              <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/85 backdrop-blur-sm transition-all">
+                {title.backdropUrl ? (
+                  <img
+                    src={title.backdropUrl}
+                    alt=""
+                    className="absolute inset-0 size-full object-cover opacity-20 filter blur-sm pointer-events-none select-none"
+                  />
+                ) : null}
+                <div className="relative z-10 flex flex-col items-center gap-3 rounded-xl border border-border/80 bg-card/95 p-6 text-center shadow-2xl max-w-sm mx-4">
                   <div className="rounded-full bg-primary/10 p-3 text-primary">
                     <Pause className="size-6 animate-pulse" />
                   </div>

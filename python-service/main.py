@@ -81,7 +81,7 @@ log = logging.getLogger("streaming-dashboard")
 # --------------------------------------------------------------------------- #
 
 # The site changes domain often; set the current one here or via env var.
-DEFAULT_SC_DOMAIN = "streamingcommunityz.academy"
+DEFAULT_SC_DOMAIN = "streamingcommunityz.photos"
 DEFAULT_VIXSRC_DOMAIN = "vixsrc.to"
 SC_DOMAIN = ""
 IMAGE_CDN = ""
