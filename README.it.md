@@ -78,7 +78,9 @@ la variabile `SC_BASE_URL` in `.env` che fungerà da API per le foto profilo. Se
 questa parte, puoi anche non impostarlo e usare il sito semplicemente seguendo le istruzioni
 base.
 
-## Riproduzione
+## Riproduzione 
+
+*Leggi solamente se vuoi capire il funzionamento tecnico*
 
 La pagina di visione è `/watch/<id>`. Per le serie, `?s=<season>&e=<episode>`
 seleziona stagione ed episodio. La riproduzione usa l'id TMDB e preferisce una
@@ -103,3 +105,13 @@ Il servizio Python indica il provider attivo tramite `GET /player`.
 I domini di embed possono cambiare e possono offrire contenuti che non hai il
 diritto di vedere. Mantieni il dominio configurabile e verifica di avere i
 diritti necessari per i contenuti a cui accedi.
+
+## Watch Together
+
+La pagina di visione include la modalità Watch Together per guardare contenuti
+insieme ad altri profili. Crea una stanza da `/watch/<id>` e condividi il codice
+della stanza o il link d'invito. Gli altri partecipanti possono entrare nello
+stesso film o episodio e ricevere in sincronia gli eventi di riproduzione,
+pausa e spostamento. Ogni stanza include anche una chat dal vivo, l'elenco dei
+partecipanti e l'indicazione dell'host. È possibile abbandonare la stanza in
+qualsiasi momento dalla finestra Watch Together.

@@ -75,6 +75,8 @@ about this, simply skip this and follow the standard process to deploy the proje
 
 ## Playback
 
+*Read this only if you want to understand how playback works from a technical perspective.*
+
 The watch page is `/watch/<id>`, with `?s=<season>&e=<episode>` selecting the
 episode for series. Playback is keyed by TMDB id and prefers a direct HLS
 playlist over the iframe embed, resolved server-side by `GET /stream`:
@@ -100,3 +102,11 @@ The Python service reports the active playback host at `GET /player`.
 
 Embed hosts rotate and may serve content you are not licensed to view — keep the
 host configurable rather than hardcoded, and check what you are pointing it at.
+
+## Watch Together
+
+The watch page includes a Watch Together mode for watching with other profiles.
+Create a room from `/watch/<id>`, then share its room code or invite link. Other
+participants can join the same movie or episode and receive synchronized play,
+pause and seek events. Each room also includes a live chat, participant list and
+host indicator. A room can be left at any time from the Watch Together dialog.
