@@ -37,7 +37,7 @@ run the Python service manually — see
 > The StreamingCommunity and Vixsrc domains can rotate over time. Both domains
 > can be changed from the admin panel in the website without restarting the service.
 > Also, streamingcommunity and vixsrc domains update automatically through a redirect
-> automatic controll performed by the backend.
+> automatic control performed by the backend.
 
 ## Configuration (.env files)
 
@@ -68,6 +68,10 @@ further profiles from `/admin`. Five wrong passwords lock a profile for
 Accounts, sessions, saved titles and watch history all live in the SQLite file at
 `SC_DB_PATH`, so back that file up and keep it out of the repository. `/library`
 shows what the signed-in profile saved and recently played.
+
+If you want to host the project, remember to set the variable `SC_BASE_URL` in `.env` for the profile pictures to
+be reachable, because it will work as an API for the profile pictures. If you don't care 
+about this, simply skip this and follow the standard process to deploy the project.
 
 ## Playback
 

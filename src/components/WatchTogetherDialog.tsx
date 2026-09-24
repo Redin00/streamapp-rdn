@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Check, Copy, Crown, Link as LinkIcon, Loader2, LogOut, Radio, Send, Users } from "lucide-react";
+import { Crown, Loader2, LogOut, Radio, Send, Users } from "lucide-react";
 
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
@@ -15,37 +15,6 @@ import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useTranslation } from "@/lib/i18n-hook";
 import type { ChatMessage, PartyMember, WatchPartyRoom } from "@/lib/party/types";
-
-async function copyToClipboard(text: string): Promise<boolean> {
-  if (navigator?.clipboard?.writeText) {
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch (e) {
-      console.warn("navigator.clipboard.writeText failed, using fallback:", e);
-    }
-  }
-
-  try {
-    const textArea = document.createElement("textarea");
-    textArea.value = text;
-    textArea.style.position = "fixed";
-    textArea.style.top = "0";
-    textArea.style.left = "-9999px";
-    textArea.style.opacity = "0";
-    textArea.setAttribute("readonly", "");
-    document.body.appendChild(textArea);
-    textArea.focus();
-    textArea.select();
-    textArea.setSelectionRange(0, text.length);
-    const successful = document.execCommand("copy");
-    document.body.removeChild(textArea);
-    return successful;
-  } catch (err) {
-    console.error("Fallback execCommand copy failed:", err);
-    return false;
-  }
-}
 
 interface WatchTogetherDialogProps {
   open: boolean;
@@ -84,34 +53,12 @@ export function WatchTogetherDialog({
 }: WatchTogetherDialogProps) {
   const { t } = useTranslation();
   const [inputCode, setInputCode] = useState("");
-  const [copiedCode, setCopiedCode] = useState(false);
-  const [copiedLink, setCopiedLink] = useState(false);
   const [chatText, setChatText] = useState("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatMessages.length]);
-
-  const handleCopyLink = async () => {
-    if (!room) return;
-    const url = new URL(window.location.href);
-    url.searchParams.set("party", room.code);
-    const ok = await copyToClipboard(url.toString());
-    if (ok) {
-      setCopiedLink(true);
-      setTimeout(() => setCopiedLink(false), 2000);
-    }
-  };
-
-  const handleCopyCode = async () => {
-    if (!room) return;
-    const ok = await copyToClipboard(room.code);
-    if (ok) {
-      setCopiedCode(true);
-      setTimeout(() => setCopiedCode(false), 2000);
-    }
-  };
 
   const handleJoinSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -149,58 +96,23 @@ export function WatchTogetherDialog({
         {room ? (
           /* Active Party Room View */
           <div className="space-y-4">
-            {/* Room Code & Invite Card */}
-            <div className="rounded-xl border border-border bg-card p-3.5 space-y-3">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-xs text-muted-foreground mb-0.5">{t("party_roomCode")}</p>
-                  <button
-                    type="button"
-                    onClick={handleCopyCode}
-                    className="group inline-flex items-center gap-2 font-mono text-2xl font-bold tracking-wider text-foreground hover:text-primary transition-colors cursor-pointer text-left"
-                    title={t("party_copyCode")}
-                  >
-                    <span>{room.code}</span>
-                    {copiedCode ? (
-                      <Check className="size-4 text-emerald-500" />
-                    ) : (
-                      <Copy className="size-4 text-muted-foreground opacity-60 group-hover:opacity-100 transition-opacity" />
-                    )}
-                  </button>
-                </div>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="size-8 text-muted-foreground hover:text-destructive"
-                  onClick={onLeaveParty}
-                  title={t("party_leave")}
-                >
-                  <LogOut className="size-4" />
-                </Button>
+            {/* Room Code Card */}
+            <div className="flex items-center justify-between rounded-xl border border-border bg-card p-3.5">
+              <div>
+                <p className="text-xs text-muted-foreground mb-0.5">{t("party_roomCode")}</p>
+                <p className="font-mono text-2xl font-bold tracking-wider text-foreground">
+                  {room.code}
+                </p>
               </div>
-
-              <div className="flex items-center gap-2 pt-2 border-t border-border/50">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={handleCopyCode}
-                  className="flex-1 gap-1.5 text-xs font-medium"
-                >
-                  {copiedCode ? <Check className="size-3.5 text-emerald-500" /> : <Copy className="size-3.5" />}
-                  {copiedCode ? t("party_copied") : t("party_copyCode")}
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={handleCopyLink}
-                  className="flex-1 gap-1.5 text-xs font-medium"
-                >
-                  {copiedLink ? <Check className="size-3.5 text-emerald-500" /> : <LinkIcon className="size-3.5" />}
-                  {copiedLink ? t("party_copied") : t("party_inviteLink")}
-                </Button>
-              </div>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-8 text-muted-foreground hover:text-destructive"
+                onClick={onLeaveParty}
+                title={t("party_leave")}
+              >
+                <LogOut className="size-4" />
+              </Button>
             </div>
 
             {/* Status indicator */}

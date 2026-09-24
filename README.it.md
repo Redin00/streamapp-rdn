@@ -37,6 +37,8 @@ per i dettagli.
 > [!NOTE]
 > I domini di StreamingCommunity e Vixsrc possono cambiare nel tempo. Entrambi
 > possono essere modificati dal pannello amministratore nel sito senza riavviare il servizio.
+> I domini vengono inoltre aggiornati automaticamente verificando i loro reindirizzamenti da
+> uno script periodico automatico, assicurando funzionalità quasi sempre.
 
 ## Configurazione (`.env`)
 
@@ -70,6 +72,11 @@ Account, sessioni, titoli salvati e cronologia di visione sono conservati nel
 file SQLite indicato da `SC_DB_PATH`. Esegui un backup del file e non inserirlo
 nel repository. `/library` mostra i titoli salvati e riprodotti di recente dal
 profilo autenticato.
+
+Se il progetto verrà hostato, ricorda che per le foto profilo devi impostare
+la variabile `SC_BASE_URL` in `.env` che fungerà da API per le foto profilo. Se non ti interessa
+questa parte, puoi anche non impostarlo e usare il sito semplicemente seguendo le istruzioni
+base.
 
 ## Riproduzione
 

@@ -181,6 +181,7 @@ function WatchPage() {
   const [partyDialogOpen, setPartyDialogOpen] = useState(Boolean(searchPartyCode));
   const [isLocalPlaying, setIsLocalPlaying] = useState(false);
   const isLocalPlayingRef = useRef(isLocalPlaying);
+  const isRoomPausedRef = useRef(false);
   useEffect(() => {
     isLocalPlayingRef.current = isLocalPlaying;
   }, [isLocalPlaying]);
@@ -311,6 +312,7 @@ function WatchPage() {
 
   const onRemotePlay = useCallback(
     (time: number) => {
+      isRoomPausedRef.current = false;
       if (playlistUrl && !hlsFailed) {
         setIsLocalPlaying(true);
         isLocalPlayingRef.current = true;
@@ -319,7 +321,7 @@ function WatchPage() {
         hlsPlayerRef.current?.play();
       } else {
         const cur = latestSecondsRef.current ?? 0;
-        const wasPaused = !isLocalPlayingRef.current;
+        const wasPaused = isRoomPausedRef.current || !isLocalPlayingRef.current;
         setIsLocalPlaying(true);
         isLocalPlayingRef.current = true;
         remoteActionRef.current = { type: "play", ts: Date.now() };
@@ -340,20 +342,16 @@ function WatchPage() {
 
   const onRemotePause = useCallback(
     (time: number) => {
+      isRoomPausedRef.current = true;
+      setIsLocalPlaying(false);
+      isLocalPlayingRef.current = false;
+      latestSecondsRef.current = time;
+      remoteActionRef.current = { type: "pause", ts: Date.now() };
       if (playlistUrl && !hlsFailed) {
-        setIsLocalPlaying(false);
-        isLocalPlayingRef.current = false;
-        latestSecondsRef.current = time;
         hlsPlayerRef.current?.pause();
-      } else {
-        setIsLocalPlaying(false);
-        isLocalPlayingRef.current = false;
-        latestSecondsRef.current = time;
-        remoteActionRef.current = { type: "pause", ts: Date.now() };
-        reloadVixsrc(time, false);
       }
     },
-    [playlistUrl, hlsFailed, reloadVixsrc],
+    [playlistUrl, hlsFailed],
   );
 
   const onRemoteSeek = useCallback(
@@ -843,6 +841,7 @@ function WatchPage() {
         } else {
           const lower = trimmed.toLowerCase();
           if (lower === "pause") {
+            isRoomPausedRef.current = true;
             setIsLocalPlaying(false);
             isLocalPlayingRef.current = false;
             const curSec = latestSecondsRef.current ?? 0;
@@ -864,6 +863,9 @@ function WatchPage() {
             return;
           }
           if (lower === "play" || lower === "playing" || lower === "start") {
+            if (isRoomPausedRef.current || !isLocalPlayingRef.current) {
+              return;
+            }
             const isStartupPlay =
               pendingIframeStartupRef.current.key === vixsrcIframeKey &&
               pendingIframeStartupRef.current.expectedAutoplay === true;
@@ -1064,6 +1066,7 @@ function WatchPage() {
 
       // Handle pause events
       if (eventName === "pause") {
+        isRoomPausedRef.current = true;
         setIsLocalPlaying(false);
         isLocalPlayingRef.current = false;
         const curSec = seconds ?? latestSecondsRef.current ?? 0;
@@ -1092,6 +1095,9 @@ function WatchPage() {
 
       // Handle play events
       if (eventName === "play" || eventName === "playing" || eventName === "start") {
+        if (isRoomPausedRef.current || !isLocalPlayingRef.current) {
+          return;
+        }
         const isStartupPlay =
           pendingIframeStartupRef.current.key === vixsrcIframeKey &&
           pendingIframeStartupRef.current.expectedAutoplay === true;
@@ -1181,10 +1187,12 @@ function WatchPage() {
               onClick={() => {
                 const cur = latestSecondsRef.current ?? party.room?.state?.time ?? 0;
                 if (isLocalPlaying) {
+                  isRoomPausedRef.current = true;
                   setIsLocalPlaying(false);
                   isLocalPlayingRef.current = false;
                   party.sendPause(cur);
                 } else {
+                  isRoomPausedRef.current = false;
                   setIsLocalPlaying(true);
                   isLocalPlayingRef.current = true;
                   party.sendPlay(cur);
@@ -1316,14 +1324,16 @@ function WatchPage() {
                 : "aspect-video rounded-xl border border-border"
             }`}
           >
-            <iframe
-              ref={iframeRef}
-              src={vixsrcEmbedUrl ?? embedUrl}
-              title={`${title.name} player`}
-              className={`size-full ${party.room && !isLocalPlaying ? "pointer-events-none" : ""}`}
-              allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
-              referrerPolicy="origin"
-            />
+            {(!party.room || isLocalPlaying) && (
+              <iframe
+                ref={iframeRef}
+                src={vixsrcEmbedUrl ?? embedUrl}
+                title={`${title.name} player`}
+                className="size-full"
+                allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
+                referrerPolicy="origin"
+              />
+            )}
 
             {/* Quick fullscreen toggle button on player container */}
             <button
@@ -1360,6 +1370,7 @@ function WatchPage() {
                       className="gap-2 font-medium"
                       onClick={() => {
                         const cur = latestSecondsRef.current ?? party.room?.state?.time ?? 0;
+                        isRoomPausedRef.current = false;
                         setIsLocalPlaying(true);
                         isLocalPlayingRef.current = true;
                         party.sendPlay(cur);
