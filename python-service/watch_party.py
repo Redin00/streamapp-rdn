@@ -207,8 +207,18 @@ class PartyRoom:
             self.member_last_seen[account_id] = self.last_activity
 
     def record_event(self, event: Dict[str, Any]):
+        now_ms = int(time.time() * 1000)
+        if not hasattr(self, "_last_ts"):
+            self._last_ts = 0
         if "timestamp" not in event:
-            event["timestamp"] = int(time.time() * 1000)
+            if now_ms <= self._last_ts:
+                now_ms = self._last_ts + 1
+            event["timestamp"] = now_ms
+        else:
+            if event["timestamp"] <= self._last_ts:
+                event["timestamp"] = self._last_ts + 1
+        self._last_ts = event["timestamp"]
+
         if "id" not in event:
             event["id"] = f"{event['timestamp']}-{secrets.token_hex(4)}"
         self.recent_events.append(event)

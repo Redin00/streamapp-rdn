@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, createFileRoute, notFound } from "@tanstack/react-router";
 import { queryOptions, useQuery, useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
-import { ArrowLeft, Loader2, Pause, Play, Users } from "lucide-react";
+import { ArrowLeft, Loader2, Maximize, Minimize, Pause, Play, Users } from "lucide-react";
 import { z } from "zod";
 
 import { HlsPlayer, type HlsPlayerHandle } from "@/components/HlsPlayer";
@@ -192,6 +192,49 @@ function WatchPage() {
 
   const hlsPlayerRef = useRef<HlsPlayerHandle>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const playerContainerRef = useRef<HTMLDivElement>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  const toggleFullscreen = useCallback(async () => {
+    try {
+      if (!document.fullscreenElement) {
+        if (playerContainerRef.current) {
+          await playerContainerRef.current.requestFullscreen();
+        }
+      } else {
+        await document.exitFullscreen();
+      }
+    } catch (err) {
+      console.warn("Fullscreen toggle error:", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(Boolean(document.fullscreenElement));
+    };
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
+  }, []);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const active = document.activeElement;
+      const isInput =
+        active instanceof HTMLInputElement ||
+        active instanceof HTMLTextAreaElement ||
+        active?.getAttribute("contenteditable") === "true";
+      if (isInput) return;
+
+      if (e.key === "f" || e.key === "F") {
+        e.preventDefault();
+        void toggleFullscreen();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [toggleFullscreen]);
+
   const lastBroadcastMediaRef = useRef<string>("");
   // Timestamp of the last remote-triggered iframe reload (ms). Events fired by the
   // newly loaded player within REMOTE_SUPPRESS_MS of this timestamp will not be re-broadcast.
@@ -307,9 +350,10 @@ function WatchPage() {
         isLocalPlayingRef.current = false;
         latestSecondsRef.current = time;
         remoteActionRef.current = { type: "pause", ts: Date.now() };
+        reloadVixsrc(time, false);
       }
     },
-    [playlistUrl, hlsFailed],
+    [playlistUrl, hlsFailed, reloadVixsrc],
   );
 
   const onRemoteSeek = useCallback(
@@ -1190,6 +1234,17 @@ function WatchPage() {
               <span>{t("party_title")}</span>
             )}
           </Button>
+
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={toggleFullscreen}
+            className="gap-1.5 text-xs font-medium"
+            title={isFullscreen ? "Esci dallo schermo intero (F)" : "Schermo intero (F)"}
+          >
+            {isFullscreen ? <Minimize className="size-3.5" /> : <Maximize className="size-3.5" />}
+            <span className="hidden sm:inline">{isFullscreen ? "Riduci" : "Schermo intero"}</span>
+          </Button>
         </div>
       </div>
 
@@ -1253,18 +1308,33 @@ function WatchPage() {
             <p className="text-xs text-muted-foreground">{t("watch_unavailable")}</p>
           ) : null}
           {adBlockPrompt.shouldShow ? <AdBlockPrompt browser={adBlockPrompt.info.browser} /> : null}
-          <div className="relative aspect-video w-full overflow-hidden rounded-xl border border-border bg-black">
-            {(!party.room || isLocalPlaying) && (
-              <iframe
-                key={vixsrcIframeKey}
-                ref={iframeRef}
-                src={vixsrcEmbedUrl ?? embedUrl}
-                title={`${title.name} player`}
-                className="size-full"
-                allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
-                referrerPolicy="origin"
-              />
-            )}
+          <div
+            ref={playerContainerRef}
+            className={`group relative w-full overflow-hidden bg-black transition-all ${
+              isFullscreen
+                ? "h-screen rounded-none border-none"
+                : "aspect-video rounded-xl border border-border"
+            }`}
+          >
+            <iframe
+              ref={iframeRef}
+              src={vixsrcEmbedUrl ?? embedUrl}
+              title={`${title.name} player`}
+              className={`size-full ${party.room && !isLocalPlaying ? "pointer-events-none" : ""}`}
+              allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
+              referrerPolicy="origin"
+            />
+
+            {/* Quick fullscreen toggle button on player container */}
+            <button
+              type="button"
+              onClick={toggleFullscreen}
+              className="absolute top-3 right-3 z-30 rounded-lg bg-black/60 p-2 text-white/80 opacity-0 backdrop-blur transition-opacity hover:bg-black/90 hover:text-white group-hover:opacity-100 focus:opacity-100"
+              title={isFullscreen ? "Esci dallo schermo intero (F)" : "Schermo intero (F)"}
+            >
+              {isFullscreen ? <Minimize className="size-4" /> : <Maximize className="size-4" />}
+            </button>
+
             {party.room && !isLocalPlaying && (
               <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/85 backdrop-blur-sm transition-all">
                 {title.backdropUrl ? (
@@ -1284,22 +1354,33 @@ function WatchPage() {
                       La stanza è in pausa. Clicca play per riprendere la visione insieme.
                     </p>
                   </div>
-                  <Button
-                    size="sm"
-                    className="gap-2 mt-1"
-                    onClick={() => {
-                      const cur = latestSecondsRef.current ?? party.room?.state?.time ?? 0;
-                      setIsLocalPlaying(true);
-                      isLocalPlayingRef.current = true;
-                      party.sendPlay(cur);
-                      if (!playlistUrl || hlsFailed) {
-                        reloadVixsrc(cur, true);
-                      }
-                    }}
-                  >
-                    <Play className="size-4 fill-current" />
-                    Riprendi insieme
-                  </Button>
+                  <div className="flex items-center gap-2 mt-1">
+                    <Button
+                      size="sm"
+                      className="gap-2 font-medium"
+                      onClick={() => {
+                        const cur = latestSecondsRef.current ?? party.room?.state?.time ?? 0;
+                        setIsLocalPlaying(true);
+                        isLocalPlayingRef.current = true;
+                        party.sendPlay(cur);
+                        if (!playlistUrl || hlsFailed) {
+                          reloadVixsrc(cur, true);
+                        }
+                      }}
+                    >
+                      <Play className="size-4 fill-current" />
+                      Riprendi insieme
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="gap-1.5"
+                      onClick={toggleFullscreen}
+                      title={isFullscreen ? "Esci dallo schermo intero" : "Schermo intero"}
+                    >
+                      {isFullscreen ? <Minimize className="size-4" /> : <Maximize className="size-4" />}
+                    </Button>
+                  </div>
                 </div>
               </div>
             )}
