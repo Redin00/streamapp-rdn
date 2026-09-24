@@ -239,7 +239,7 @@ function WatchPage() {
   const [vixsrcAutoplay, setVixsrcAutoplay] = useState<boolean | undefined>(undefined);
   // Incremented to force the iframe to fully remount when remote sync requires a reload
   const [vixsrcIframeKey, setVixsrcIframeKey] = useState(0);
-const REMOTE_SUPPRESS_MS = 6000; // ms, covers iframe reload latency and remote action window
+const REMOTE_SUPPRESS_MS = 8000; // ms, covers iframe reload latency and remote action window
 
   const hlsPlayerRef = useRef<HlsPlayerHandle>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
@@ -309,10 +309,6 @@ const REMOTE_SUPPRESS_MS = 6000; // ms, covers iframe reload latency and remote 
         setVixsrcStartAt(t);
         setVixsrcAutoplay(false);
         setVixsrcIframeKey((k) => k + 1);
-        // Force a pause command after the iframe reload (some players ignore autoplay=0)
-        setTimeout(() => {
-          sendIframePlayerCommand(iframeRef.current, "pause");
-        }, 300);
       }
     },
     [playlistUrl, hlsFailed],
@@ -508,6 +504,7 @@ const REMOTE_SUPPRESS_MS = 6000; // ms, covers iframe reload latency and remote 
 
       // Immediately set the room so UI transitions to the active room view without delay
       party.setRoom(res.room);
+      party.setCurrentAccountId(res.room.hostId);
       const cleanCode = res.room.code.trim().toUpperCase();
       setPartyCode(cleanCode);
       try {
@@ -759,6 +756,9 @@ const REMOTE_SUPPRESS_MS = 6000; // ms, covers iframe reload latency and remote 
     if (!markerLoaded) return;
 
     const handlePlayerMessage = (event: MessageEvent) => {
+      // Ignore self-dispatched messages
+      if (event.source === window) return;
+
       let data = event.data;
       if (!data) return;
 
@@ -782,7 +782,6 @@ const REMOTE_SUPPRESS_MS = 6000; // ms, covers iframe reload latency and remote 
             return;
           }
         } else {
-          remoteActionRef.current = { type: "seek", ts: Date.now() };
           const lower = trimmed.toLowerCase();
           if (lower === "pause") {
             setIsLocalPlaying(false);
@@ -790,7 +789,8 @@ const REMOTE_SUPPRESS_MS = 6000; // ms, covers iframe reload latency and remote 
             persistMarker(curSec, true);
             const suppressBroadcast =
               party.isRemoteSyncingRef.current ||
-              Date.now() - lastRemoteReloadRef.current < 5000;
+              Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS ||
+              (remoteActionRef.current.type === "pause" && Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS);
             if (!suppressBroadcast && party.room) {
               party.sendPause(curSec);
             }
@@ -799,9 +799,11 @@ const REMOTE_SUPPRESS_MS = 6000; // ms, covers iframe reload latency and remote 
           if (lower === "play" || lower === "playing" || lower === "start") {
             setIsLocalPlaying(true);
             const curSec = latestSecondsRef.current ?? 0;
+            latestSecondsRef.current = curSec;
             const suppressBroadcast =
               party.isRemoteSyncingRef.current ||
-              Date.now() - lastRemoteReloadRef.current < 5000;
+              Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS ||
+              (remoteActionRef.current.type === "play" && Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS);
             if (!suppressBroadcast && party.room) {
               party.sendPlay(curSec);
             }
@@ -812,7 +814,8 @@ const REMOTE_SUPPRESS_MS = 6000; // ms, covers iframe reload latency and remote 
             persistMarker(curSec, true);
             const suppressBroadcast =
               party.isRemoteSyncingRef.current ||
-              Date.now() - lastRemoteReloadRef.current < 5000;
+              Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS ||
+              (remoteActionRef.current.type === "seek" && Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS);
             if (!suppressBroadcast && party.room) {
               party.sendSeek(curSec);
             }
