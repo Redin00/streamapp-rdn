@@ -75,6 +75,12 @@ CREATE TABLE IF NOT EXISTS app_settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS catalogue_cache (
+    key         TEXT PRIMARY KEY,
+    payload     TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
 """
 
 
@@ -135,6 +141,38 @@ def set_setting(key: str, value: str) -> None:
             """,
             (key, value),
         )
+
+
+def get_db_cache(key: str) -> Optional[tuple[float, Any]]:
+    """Return (updated_at_seconds, payload_dict) if present in SQLite, else None."""
+    with connect() as conn:
+        row = conn.execute("SELECT payload, updated_at FROM catalogue_cache WHERE key = ?", (key,)).fetchone()
+    if row is None:
+        return None
+    try:
+        data = json.loads(row["payload"])
+        return (float(row["updated_at"]) / 1000.0, data)
+    except Exception:
+        return None
+
+
+def set_db_cache(key: str, data: Any) -> None:
+    """Store cached catalogue payload into SQLite for persistent survival across restarts."""
+    payload_str = json.dumps(data, ensure_ascii=False)
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO catalogue_cache (key, payload, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+            """,
+            (key, payload_str, now()),
+        )
+
+
+def clear_db_cache() -> None:
+    """Purge all cached catalogue payloads."""
+    with connect() as conn:
+        conn.execute("DELETE FROM catalogue_cache")
 
 
 def _number(value: Any) -> Optional[float]:

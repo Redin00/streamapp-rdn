@@ -48,6 +48,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -69,7 +70,14 @@ from scuapi import API
 
 from auth import bootstrap_admin, require_admin
 from auth import router as auth_router
-from db import get_setting, init_db, set_setting
+from db import (
+    clear_db_cache,
+    get_db_cache,
+    get_setting,
+    init_db,
+    set_db_cache,
+    set_setting,
+)
 from library import router as library_router
 from watch_party import router as party_router, handle_party_websocket
 
@@ -92,7 +100,8 @@ DEFAULT_SC_DOMAIN = "streamingcommunityz.photos"
 DEFAULT_VIXSRC_DOMAIN = "vixsrc.to"
 SC_DOMAIN = ""
 IMAGE_CDN = ""
-CACHE_TTL = int(os.environ.get("SC_CACHE_TTL", "600"))  # seconds
+# Default cache TTL: 30 minutes (1800s) to avoid unnecessary upstream load
+CACHE_TTL = int(os.environ.get("SC_CACHE_TTL", "1800"))
 CORS_ORIGINS = os.environ.get("SC_CORS_ORIGINS", "*").split(",")
 
 MODERN_USER_AGENT = (
@@ -117,6 +126,25 @@ JSON_HEADERS = {
     "x-requested-with": "XMLHttpRequest",
 }
 
+# --------------------------------------------------------------------------- #
+# Upstream Request Pacing (prevents Cloudflare rate-limit burst blocks)
+# --------------------------------------------------------------------------- #
+
+_sc_pacing_lock = threading.Lock()
+_last_upstream_request = 0.0
+_MIN_PACING_INTERVAL = 0.8  # minimum 800ms between upstream calls to avoid burst blocks
+
+
+def pace_upstream_request() -> None:
+    """Ensure consecutive requests to StreamingCommunity are paced by at least _MIN_PACING_INTERVAL."""
+    global _last_upstream_request
+    with _sc_pacing_lock:
+        now_time = time.time()
+        wait = _MIN_PACING_INTERVAL - (now_time - _last_upstream_request)
+        if wait > 0:
+            time.sleep(wait)
+        _last_upstream_request = time.time()
+
 
 def create_browser_session() -> Any:
     """Create a browser session that impersonates Google Chrome TLS fingerprint if curl_cffi is available."""
@@ -125,6 +153,22 @@ def create_browser_session() -> Any:
     s = requests.Session()
     s.headers.update(JSON_HEADERS)
     return s
+
+
+def _setup_api_session(api_instance: Any) -> None:
+    """Equip scuapi with a browser-impersonating session wrapped with request pacing."""
+    if HAS_CURL_CFFI:
+        api_instance.session = create_browser_session()
+    else:
+        api_instance.session.headers.update(DEFAULT_BROWSER_HEADERS)
+
+    orig_req = api_instance.session.request
+
+    def paced_req(*args, **kwargs):
+        pace_upstream_request()
+        return orig_req(*args, **kwargs)
+
+    api_instance.session.request = paced_req
 
 
 # Playback embed host. Rotates like SC_DOMAIN; leave empty to disable playback.
@@ -161,14 +205,11 @@ VIXSRC_DOMAIN = get_setting(
 ).strip()
 IMAGE_CDN = f"https://cdn.{SC_DOMAIN}/images"
 api = API(SC_DOMAIN, user_agent=MODERN_USER_AGENT)
-if HAS_CURL_CFFI:
-    api.session = create_browser_session()
-else:
-    api.session.headers.update(DEFAULT_BROWSER_HEADERS)
+_setup_api_session(api)
 bootstrap_admin()
 
 # --------------------------------------------------------------------------- #
-# Tiny in-process cache (the upstream site is slow and rate-limits)
+# In-process & persistent SQLite cache (with stale fallback on upstream rate limits)
 # --------------------------------------------------------------------------- #
 
 _cache: Dict[str, tuple[float, Any]] = {}
@@ -181,15 +222,16 @@ def configure_domains(sc_domain: str, vixsrc_domain: str) -> None:
     VIXSRC_DOMAIN = vixsrc_domain
     IMAGE_CDN = f"https://cdn.{SC_DOMAIN}/images"
     api = API(SC_DOMAIN, user_agent=MODERN_USER_AGENT)
-    if HAS_CURL_CFFI:
-        api.session = create_browser_session()
-    else:
-        api.session.headers.update(DEFAULT_BROWSER_HEADERS)
+    _setup_api_session(api)
     vixsrc_session.headers.update(DEFAULT_BROWSER_HEADERS)
     _last_sc_redirect_check = 0.0
     _last_vixsrc_redirect_check = 0.0
     if domain_changed:
         _cache.clear()
+        try:
+            clear_db_cache()
+        except Exception:
+            pass
         sc_session = create_browser_session()
 
 
@@ -450,15 +492,15 @@ def check_all_domains_redirect(force: bool = False) -> Dict[str, Any]:
 
 
 async def periodic_domain_check() -> None:
-    # Run 5s after startup, then every 30 minutes
-    await asyncio.sleep(5)
+    # Run 60s after startup, then every 6 hours (21600s) to avoid unnecessary upstream load
+    await asyncio.sleep(60)
     while True:
         try:
             log.debug("Running periodic catalogue and playback domain redirect check...")
             await asyncio.to_thread(check_all_domains_redirect, force=True)
         except Exception as exc:
             log.warning("Periodic domain redirect check error: %s", exc)
-        await asyncio.sleep(1800)
+        await asyncio.sleep(21600)
 
 
 @asynccontextmanager
@@ -529,12 +571,14 @@ def warm_up_sc_session() -> None:
 def _fetch_sc_json(url: str, params: Optional[Dict[str, Any]] = None, timeout: int = 20) -> Any:
     global sc_session
     headers = {"accept": "application/json"}
+    pace_upstream_request()
     try:
         res = sc_session.get(url, params=params, headers=headers, timeout=timeout)
     except Exception as exc:
         log.warning("sc_session request to %s failed: %s; refreshing browser session", url, exc)
         sc_session = create_browser_session()
         warm_up_sc_session()
+        pace_upstream_request()
         res = sc_session.get(url, params=params, headers=headers, timeout=timeout)
 
     if res.status_code in (403, 429):
@@ -546,33 +590,50 @@ def _fetch_sc_json(url: str, params: Optional[Dict[str, Any]] = None, timeout: i
         time.sleep(1.0)
         sc_session = create_browser_session()
         warm_up_sc_session()
+        pace_upstream_request()
         res = sc_session.get(url, params=params, headers=headers, timeout=timeout)
     return res
 
 
-def cached(key: str, producer):
+def cached(key: str, producer, ttl: Optional[int] = None):
+    effective_ttl = ttl if ttl is not None else CACHE_TTL
+    now_ts = time.time()
+
+    # 1. In-memory cache hit
     hit = _cache.get(key)
-    now = time.time()
-    if hit and now - hit[0] < CACHE_TTL:
-        log.debug("cache hit key=%r age=%.1fs", key, now - hit[0])
+    if hit and (now_ts - hit[0] < effective_ttl):
+        log.debug("cache hit memory key=%r age=%.1fs", key, now_ts - hit[0])
         return hit[1]
 
-    log.debug("cache miss key=%r", key)
+    # 2. Persistent SQLite cache hit
+    db_hit = get_db_cache(key)
+    if db_hit and (now_ts - db_hit[0] < effective_ttl):
+        log.debug("cache hit db key=%r age=%.1fs", key, now_ts - db_hit[0])
+        _cache[key] = db_hit
+        return db_hit[1]
+
+    stale = hit if hit is not None else db_hit
+
+    log.debug("cache miss key=%r (stale available: %s)", key, stale is not None)
     try:
         value = producer()
     except Exception as exc:
-        if hit is not None:
+        if stale is not None:
             log.warning(
                 "cache producer failed for key=%r: %s; serving stale cache (age=%.1fs)",
                 key,
                 exc,
-                now - hit[0],
+                now_ts - stale[0],
             )
-            return hit[1]
+            return stale[1]
         log.exception("cache producer failed for key=%r with no stale cache", key)
         raise
 
-    _cache[key] = (now, value)
+    _cache[key] = (now_ts, value)
+    try:
+        set_db_cache(key, value)
+    except Exception as e:
+        log.warning("failed to persist cache in db for key=%r: %s", key, e)
     log.debug("cache store key=%r", key)
     return value
 
@@ -1062,7 +1123,7 @@ def title(content_id: str):
         return detail_from_load(content_id, raw)
 
     try:
-        return cached(f"title:{content_id}", load)
+        return cached(f"title:{content_id}", load, ttl=86400)
     except Exception as exc:
         log.exception("title %r failed", content_id)
         raise HTTPException(status_code=404, detail=f"title not found: {exc}")
@@ -1071,9 +1132,9 @@ def title(content_id: str):
 @app.get("/stats")
 def stats():
     def build():
-        items = browse("latest", limit=60)
+        items = cached("latest", lambda: browse("latest", limit=60))
         try:
-            items += browse("trending", limit=60)
+            items = items + cached("trending", lambda: browse("trending"))
         except Exception:
             log.warning("stats: browse('trending') failed, using 'latest' only", exc_info=True)
         titles = list({i["id"]: i for i in items}.values())
@@ -1113,7 +1174,7 @@ def stats():
         }
 
     try:
-        return cached("stats", build)
+        return cached("stats", build, ttl=3600)
     except Exception as exc:
         log.exception("stats failed")
         raise HTTPException(status_code=502, detail=f"upstream stats failed: {exc}")

@@ -3,17 +3,20 @@ from unittest.mock import MagicMock, patch
 import requests
 
 import main
+from db import connect
 
 
 class TestCacheAndProtection(unittest.TestCase):
     def setUp(self):
         main._cache.clear()
+        main.clear_db_cache()
         self.orig_sc = main.SC_DOMAIN
         self.orig_vix = main.VIXSRC_DOMAIN
 
     def tearDown(self):
         main.configure_domains(self.orig_sc, self.orig_vix)
         main._cache.clear()
+        main.clear_db_cache()
 
     def test_cached_serves_stale_on_producer_failure(self):
         calls = 0
@@ -29,8 +32,10 @@ class TestCacheAndProtection(unittest.TestCase):
         res1 = main.cached("test_key", flaky_producer)
         self.assertEqual(len(res1), 1)
 
-        # Force cache entry to be older than TTL
+        # Force cache entry in memory and SQLite to be older than TTL
         main._cache["test_key"] = (0.0, res1)
+        with connect() as conn:
+            conn.execute("UPDATE catalogue_cache SET updated_at = 0 WHERE key = 'test_key'")
 
         # Second call triggers producer, which fails with 403, but returns stale cache
         res2 = main.cached("test_key", flaky_producer)
