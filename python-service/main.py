@@ -88,6 +88,28 @@ IMAGE_CDN = ""
 CACHE_TTL = int(os.environ.get("SC_CACHE_TTL", "600"))  # seconds
 CORS_ORIGINS = os.environ.get("SC_CORS_ORIGINS", "*").split(",")
 
+MODERN_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+DEFAULT_BROWSER_HEADERS = {
+    "user-agent": MODERN_USER_AGENT,
+    "accept-language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+    "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
+
+JSON_HEADERS = {
+    **DEFAULT_BROWSER_HEADERS,
+    "accept": "application/json, text/plain, */*",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+    "x-requested-with": "XMLHttpRequest",
+}
+
 # Playback embed host. Rotates like SC_DOMAIN; leave empty to disable playback.
 VIXSRC_DOMAIN = ""
 
@@ -95,7 +117,15 @@ api = None
 
 # The playback host is scraped over two back-to-back requests, so pool them.
 vixsrc_session = requests.Session()
-JSON_HEADERS = {}
+vixsrc_session.headers.update(DEFAULT_BROWSER_HEADERS)
+
+# Shared session for StreamingCommunity catalogue to preserve Cloudflare / Laravel cookies.
+sc_session = requests.Session()
+sc_session.headers.update(JSON_HEADERS)
+
+_last_sc_redirect_check: float = 0.0
+_last_vixsrc_redirect_check: float = 0.0
+_REDIRECT_CHECK_COOLDOWN: float = 60.0  # seconds
 
 # Where uploaded profile pictures are stored (defaults to an `uploads` folder beside this file).
 _PROFILE_PICTURES_DIR = Path(os.environ.get("SC_PROFILE_PICTURES_DIR", str(Path(__file__).parent / "uploads")))
@@ -114,9 +144,8 @@ VIXSRC_DOMAIN = get_setting(
     "vixsrc_domain", os.environ.get("SC_VIXSRC_DOMAIN", DEFAULT_VIXSRC_DOMAIN)
 ).strip()
 IMAGE_CDN = f"https://cdn.{SC_DOMAIN}/images"
-api = API(SC_DOMAIN)
-vixsrc_session.headers["user-agent"] = api.user_agent
-JSON_HEADERS = {"user-agent": api.user_agent, "accept": "application/json"}
+api = API(SC_DOMAIN, user_agent=MODERN_USER_AGENT)
+api.session.headers.update(DEFAULT_BROWSER_HEADERS)
 bootstrap_admin()
 
 # --------------------------------------------------------------------------- #
@@ -127,14 +156,20 @@ _cache: Dict[str, tuple[float, Any]] = {}
 
 
 def configure_domains(sc_domain: str, vixsrc_domain: str) -> None:
-    global SC_DOMAIN, VIXSRC_DOMAIN, IMAGE_CDN, api, JSON_HEADERS
+    global SC_DOMAIN, VIXSRC_DOMAIN, IMAGE_CDN, api, _last_sc_redirect_check, _last_vixsrc_redirect_check
+    domain_changed = (sc_domain != SC_DOMAIN)
     SC_DOMAIN = sc_domain
     VIXSRC_DOMAIN = vixsrc_domain
     IMAGE_CDN = f"https://cdn.{SC_DOMAIN}/images"
-    api = API(SC_DOMAIN)
-    vixsrc_session.headers["user-agent"] = api.user_agent
-    JSON_HEADERS = {"user-agent": api.user_agent, "accept": "application/json"}
-    _cache.clear()
+    api = API(SC_DOMAIN, user_agent=MODERN_USER_AGENT)
+    api.session.headers.update(DEFAULT_BROWSER_HEADERS)
+    vixsrc_session.headers.update(DEFAULT_BROWSER_HEADERS)
+    sc_session.headers.update(JSON_HEADERS)
+    _last_sc_redirect_check = 0.0
+    _last_vixsrc_redirect_check = 0.0
+    if domain_changed:
+        _cache.clear()
+        sc_session.cookies.clear()
 
 
 def current_domains() -> tuple[str, str]:
@@ -170,8 +205,9 @@ def _is_valid_sc_redirect(target_host: str, page_content: str = "") -> bool:
     return False
 
 
-def check_domain_redirect(target_domain: Optional[str] = None) -> Dict[str, Any]:
+def check_domain_redirect(target_domain: Optional[str] = None, force: bool = False) -> Dict[str, Any]:
     """Check if the StreamingCommunity domain redirects to a new domain and update if so."""
+    global _last_sc_redirect_check
     current = (target_domain or SC_DOMAIN).strip().lower()
     if not current:
         return {
@@ -182,7 +218,22 @@ def check_domain_redirect(target_domain: Optional[str] = None) -> Dict[str, Any]
             "error": "no domain configured",
         }
 
-    headers = {"user-agent": api.user_agent if api else "Mozilla/5.0"}
+    now = time.time()
+    if not force and target_domain is None and (now - _last_sc_redirect_check < _REDIRECT_CHECK_COOLDOWN):
+        log.debug("check_domain_redirect throttled (%.1fs since last check)", now - _last_sc_redirect_check)
+        return {
+            "checked": False,
+            "redirected": False,
+            "previousDomain": current,
+            "currentDomain": SC_DOMAIN,
+            "cooldown": True,
+        }
+    _last_sc_redirect_check = now
+
+    headers = {
+        **DEFAULT_BROWSER_HEADERS,
+        "user-agent": api.user_agent if api else MODERN_USER_AGENT,
+    }
     res = None
     last_err: Optional[Exception] = None
 
@@ -264,8 +315,9 @@ def _is_valid_vixsrc_redirect(target_host: str, page_content: str = "") -> bool:
     return False
 
 
-def check_vixsrc_redirect(target_domain: Optional[str] = None) -> Dict[str, Any]:
+def check_vixsrc_redirect(target_domain: Optional[str] = None, force: bool = False) -> Dict[str, Any]:
     """Check if the Vixsrc playback domain redirects to a new domain and update if so."""
+    global _last_vixsrc_redirect_check
     current = (target_domain or VIXSRC_DOMAIN).strip().lower()
     if not current:
         return {
@@ -276,7 +328,22 @@ def check_vixsrc_redirect(target_domain: Optional[str] = None) -> Dict[str, Any]
             "error": "no playback domain configured",
         }
 
-    headers = {"user-agent": vixsrc_session.headers.get("user-agent", "Mozilla/5.0")}
+    now = time.time()
+    if not force and target_domain is None and (now - _last_vixsrc_redirect_check < _REDIRECT_CHECK_COOLDOWN):
+        log.debug("check_vixsrc_redirect throttled (%.1fs since last check)", now - _last_vixsrc_redirect_check)
+        return {
+            "checked": False,
+            "redirected": False,
+            "previousDomain": current,
+            "currentDomain": VIXSRC_DOMAIN,
+            "cooldown": True,
+        }
+    _last_vixsrc_redirect_check = now
+
+    headers = {
+        **DEFAULT_BROWSER_HEADERS,
+        "user-agent": vixsrc_session.headers.get("user-agent", MODERN_USER_AGENT),
+    }
     res = None
     last_err: Optional[Exception] = None
 
@@ -342,9 +409,9 @@ def check_vixsrc_redirect(target_domain: Optional[str] = None) -> Dict[str, Any]
     }
 
 
-def check_all_domains_redirect() -> Dict[str, Any]:
-    sc_res = check_domain_redirect()
-    vix_res = check_vixsrc_redirect()
+def check_all_domains_redirect(force: bool = False) -> Dict[str, Any]:
+    sc_res = check_domain_redirect(force=force)
+    vix_res = check_vixsrc_redirect(force=force)
     any_redirected = sc_res.get("redirected", False) or vix_res.get("redirected", False)
     all_checked = sc_res.get("checked", False) and vix_res.get("checked", False)
     errors = [e for e in [sc_res.get("error"), vix_res.get("error")] if e]
@@ -367,7 +434,7 @@ async def periodic_domain_check() -> None:
     while True:
         try:
             log.debug("Running periodic catalogue and playback domain redirect check...")
-            await asyncio.to_thread(check_all_domains_redirect)
+            await asyncio.to_thread(check_all_domains_redirect, force=True)
         except Exception as exc:
             log.warning("Periodic domain redirect check error: %s", exc)
         await asyncio.sleep(1800)
@@ -427,6 +494,39 @@ app.mount(
 )
 
 
+def warm_up_sc_session() -> None:
+    """Visit the catalogue site homepage to obtain initial Cloudflare & Laravel session cookies."""
+    try:
+        url = f"https://{SC_DOMAIN}"
+        headers = {
+            **DEFAULT_BROWSER_HEADERS,
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "none",
+            "sec-fetch-user": "?1",
+        }
+        res = sc_session.get(url, headers=headers, timeout=10)
+        log.debug("warm_up_sc_session %s status=%s cookies=%s", url, res.status_code, list(sc_session.cookies.keys()))
+    except Exception as exc:
+        log.debug("warm_up_sc_session failed: %s", exc)
+
+
+def _fetch_sc_json(url: str, params: Optional[Dict[str, Any]] = None, timeout: int = 20) -> requests.Response:
+    if not sc_session.cookies:
+        warm_up_sc_session()
+    res = sc_session.get(url, params=params, headers=JSON_HEADERS, timeout=timeout)
+    if res.status_code in (403, 429):
+        log.warning(
+            "sc_session request to %s returned %s; re-warming session cookies and retrying",
+            url,
+            res.status_code,
+        )
+        warm_up_sc_session()
+        res = sc_session.get(url, params=params, headers=JSON_HEADERS, timeout=timeout)
+    return res
+
+
 def cached(key: str, producer):
     hit = _cache.get(key)
     now = time.time()
@@ -437,8 +537,16 @@ def cached(key: str, producer):
     log.debug("cache miss key=%r", key)
     try:
         value = producer()
-    except Exception:
-        log.exception("cache producer failed for key=%r", key)
+    except Exception as exc:
+        if hit is not None:
+            log.warning(
+                "cache producer failed for key=%r: %s; serving stale cache (age=%.1fs)",
+                key,
+                exc,
+                now - hit[0],
+            )
+            return hit[1]
+        log.exception("cache producer failed for key=%r with no stale cache", key)
         raise
 
     _cache[key] = (now, value)
@@ -590,14 +698,14 @@ def browse(slider: str, limit: int = 24) -> List[Dict[str, Any]]:
     url = f"https://{SC_DOMAIN}/it/browse/{slider}"
     log.debug("browse GET %s", url)
     try:
-        res = requests.get(url, headers=JSON_HEADERS, timeout=20)
+        res = _fetch_sc_json(url, timeout=20)
     except requests.RequestException:
         log.warning("browse request to %s failed, checking domain redirect", url)
         check = check_domain_redirect()
         if check.get("redirected"):
             url = f"https://{SC_DOMAIN}/it/browse/{slider}"
             log.info("retrying browse GET %s with new domain", url)
-            res = requests.get(url, headers=JSON_HEADERS, timeout=20)
+            res = _fetch_sc_json(url, timeout=20)
         else:
             raise
 
@@ -635,14 +743,14 @@ def archive_total(media_type: Optional[str] = None) -> int:
     params = {"type": media_type} if media_type else {}
     log.debug("archive GET %s params=%s", url, params)
     try:
-        res = requests.get(url, params=params, headers=JSON_HEADERS, timeout=20)
+        res = _fetch_sc_json(url, params=params, timeout=20)
     except requests.RequestException:
         log.warning("archive request to %s failed, checking domain redirect", url)
         check = check_domain_redirect()
         if check.get("redirected"):
             url = f"https://{SC_DOMAIN}/it/archive"
             log.info("retrying archive GET %s with new domain", url)
-            res = requests.get(url, params=params, headers=JSON_HEADERS, timeout=20)
+            res = _fetch_sc_json(url, params=params, timeout=20)
         else:
             raise
 
@@ -832,7 +940,7 @@ def update_domain_settings(
 
 @app.post("/settings/domains/check-redirect")
 def check_domain_redirect_endpoint(_: Dict[str, Any] = Depends(require_admin)):
-    return check_all_domains_redirect()
+    return check_all_domains_redirect(force=True)
 
 
 @app.get("/player")
