@@ -54,6 +54,13 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import requests
+try:
+    from curl_cffi import requests as c_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    import requests as c_requests  # type: ignore
+    HAS_CURL_CFFI = False
+
 from fastapi import Depends, FastAPI, HTTPException, Query, Response, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -110,6 +117,16 @@ JSON_HEADERS = {
     "x-requested-with": "XMLHttpRequest",
 }
 
+
+def create_browser_session() -> Any:
+    """Create a browser session that impersonates Google Chrome TLS fingerprint if curl_cffi is available."""
+    if HAS_CURL_CFFI:
+        return c_requests.Session(impersonate="chrome")
+    s = requests.Session()
+    s.headers.update(JSON_HEADERS)
+    return s
+
+
 # Playback embed host. Rotates like SC_DOMAIN; leave empty to disable playback.
 VIXSRC_DOMAIN = ""
 
@@ -119,9 +136,8 @@ api = None
 vixsrc_session = requests.Session()
 vixsrc_session.headers.update(DEFAULT_BROWSER_HEADERS)
 
-# Shared session for StreamingCommunity catalogue to preserve Cloudflare / Laravel cookies.
-sc_session = requests.Session()
-sc_session.headers.update(JSON_HEADERS)
+# Shared session for StreamingCommunity catalogue (impersonates Chrome TLS to avoid Cloudflare 403 blocks)
+sc_session = create_browser_session()
 
 _last_sc_redirect_check: float = 0.0
 _last_vixsrc_redirect_check: float = 0.0
@@ -145,7 +161,10 @@ VIXSRC_DOMAIN = get_setting(
 ).strip()
 IMAGE_CDN = f"https://cdn.{SC_DOMAIN}/images"
 api = API(SC_DOMAIN, user_agent=MODERN_USER_AGENT)
-api.session.headers.update(DEFAULT_BROWSER_HEADERS)
+if HAS_CURL_CFFI:
+    api.session = create_browser_session()
+else:
+    api.session.headers.update(DEFAULT_BROWSER_HEADERS)
 bootstrap_admin()
 
 # --------------------------------------------------------------------------- #
@@ -156,20 +175,22 @@ _cache: Dict[str, tuple[float, Any]] = {}
 
 
 def configure_domains(sc_domain: str, vixsrc_domain: str) -> None:
-    global SC_DOMAIN, VIXSRC_DOMAIN, IMAGE_CDN, api, _last_sc_redirect_check, _last_vixsrc_redirect_check
+    global SC_DOMAIN, VIXSRC_DOMAIN, IMAGE_CDN, api, _last_sc_redirect_check, _last_vixsrc_redirect_check, sc_session
     domain_changed = (sc_domain != SC_DOMAIN)
     SC_DOMAIN = sc_domain
     VIXSRC_DOMAIN = vixsrc_domain
     IMAGE_CDN = f"https://cdn.{SC_DOMAIN}/images"
     api = API(SC_DOMAIN, user_agent=MODERN_USER_AGENT)
-    api.session.headers.update(DEFAULT_BROWSER_HEADERS)
+    if HAS_CURL_CFFI:
+        api.session = create_browser_session()
+    else:
+        api.session.headers.update(DEFAULT_BROWSER_HEADERS)
     vixsrc_session.headers.update(DEFAULT_BROWSER_HEADERS)
-    sc_session.headers.update(JSON_HEADERS)
     _last_sc_redirect_check = 0.0
     _last_vixsrc_redirect_check = 0.0
     if domain_changed:
         _cache.clear()
-        sc_session.cookies.clear()
+        sc_session = create_browser_session()
 
 
 def current_domains() -> tuple[str, str]:
@@ -496,34 +517,36 @@ app.mount(
 
 def warm_up_sc_session() -> None:
     """Visit the catalogue site homepage to obtain initial Cloudflare & Laravel session cookies."""
+    global sc_session
     try:
         url = f"https://{SC_DOMAIN}"
-        headers = {
-            **DEFAULT_BROWSER_HEADERS,
-            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "sec-fetch-dest": "document",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-site": "none",
-            "sec-fetch-user": "?1",
-        }
-        res = sc_session.get(url, headers=headers, timeout=10)
-        log.debug("warm_up_sc_session %s status=%s cookies=%s", url, res.status_code, list(sc_session.cookies.keys()))
+        res = sc_session.get(url, timeout=10)
+        log.debug("warm_up_sc_session %s status=%s", url, res.status_code)
     except Exception as exc:
         log.debug("warm_up_sc_session failed: %s", exc)
 
 
-def _fetch_sc_json(url: str, params: Optional[Dict[str, Any]] = None, timeout: int = 20) -> requests.Response:
-    if not sc_session.cookies:
+def _fetch_sc_json(url: str, params: Optional[Dict[str, Any]] = None, timeout: int = 20) -> Any:
+    global sc_session
+    headers = {"accept": "application/json"}
+    try:
+        res = sc_session.get(url, params=params, headers=headers, timeout=timeout)
+    except Exception as exc:
+        log.warning("sc_session request to %s failed: %s; refreshing browser session", url, exc)
+        sc_session = create_browser_session()
         warm_up_sc_session()
-    res = sc_session.get(url, params=params, headers=JSON_HEADERS, timeout=timeout)
+        res = sc_session.get(url, params=params, headers=headers, timeout=timeout)
+
     if res.status_code in (403, 429):
         log.warning(
-            "sc_session request to %s returned %s; re-warming session cookies and retrying",
+            "sc_session request to %s returned %s; renewing browser session and retrying with backoff",
             url,
             res.status_code,
         )
+        time.sleep(1.0)
+        sc_session = create_browser_session()
         warm_up_sc_session()
-        res = sc_session.get(url, params=params, headers=JSON_HEADERS, timeout=timeout)
+        res = sc_session.get(url, params=params, headers=headers, timeout=timeout)
     return res
 
 
