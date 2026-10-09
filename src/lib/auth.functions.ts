@@ -120,21 +120,14 @@ export const logout = createServerFn({ method: "POST" }).handler(
   },
 );
 
-/** `null` covers an expired token, a revoked one and a service that is down alike. Falls back to the mock viewer when the service is unreachable. */
+/** `null` covers an expired token, a revoked one, a missing session, or a service that is down. */
 export const getViewer = createServerFn({ method: "GET" }).handler(
   async (): Promise<Viewer | null> => {
     try {
       return await serviceFetch<Viewer>("/auth/me");
-    } catch {
-      const mockToken = "mock-token";
-      const profile = mockProfiles[0];
-      if (profile && mockToken) {
-        return {
-          id: profile.id,
-          name: profile.name,
-          role: "admin",
-          color: profile.color,
-        };
+    } catch (error) {
+      if (error instanceof ServiceError && error.status === 401) {
+        deleteCookie(SESSION_COOKIE, COOKIE);
       }
       return null;
     }

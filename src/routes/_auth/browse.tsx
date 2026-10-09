@@ -3,6 +3,7 @@ import { queryOptions, useSuspenseQuery } from "@tanstack/react-query";
 import { useState } from "react";
 
 import { TitleCard } from "@/components/TitleCard";
+import { ScrollableRow } from "@/components/ScrollableRow";
 import { getLatest } from "@/lib/streaming.functions";
 import { useTranslation } from "@/lib/i18n-hook";
 
@@ -54,7 +55,7 @@ function Browse() {
         </p>
       </div>
 
-      <div className="flex overflow-x-auto overflow-y-hidden whitespace-nowrap -mx-1 px-1 scrollbar-none sm:overflow-visible sm:whitespace-normal">
+      <ScrollableRow>
         {(["all", "movie", "tv"] as Filter[]).map((f) => (
           <button
             key={f}
@@ -74,14 +75,14 @@ function Browse() {
         ))}
         {hasGenres ? (
           <>
-            <span className="mx-2 w-px shrink-0 bg-border" />
+            <span className="mx-1 h-5 w-px shrink-0 bg-border" />
             {genres.map((g) => (
               <button
                 key={g}
                 onClick={() => setGenre(g)}
                 className={`shrink-0 rounded-full border px-4 py-1.5 text-xs font-medium transition-colors ${
                   genre === g
-                    ? "border-primary text-primary"
+                    ? "border-primary bg-primary/10 text-primary font-semibold"
                     : "border-border text-muted-foreground hover:border-primary/50"
                 }`}
               >
@@ -90,7 +91,7 @@ function Browse() {
             ))}
           </>
         ) : null}
-      </div>
+      </ScrollableRow>
 
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
         {visible.map((t) => (

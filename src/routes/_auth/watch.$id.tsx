@@ -7,6 +7,7 @@ import { z } from "zod";
 import { HlsPlayer, type HlsPlayerHandle } from "@/components/HlsPlayer";
 import { AdBlockPrompt, useAdBlockPrompt } from "@/components/AdBlockPrompt";
 import { WatchTogetherDialog } from "@/components/WatchTogetherDialog";
+import { ScrollableRow } from "@/components/ScrollableRow";
 import { Button } from "@/components/ui/button";
 import { useBrowserInfo } from "@/hooks/use-browser-info";
 import { historyQuery } from "@/lib/auth/queries";
@@ -1408,14 +1409,14 @@ function WatchPage() {
 
       {activeSeason && activeSeason.episodes.length > 0 ? (
         <section className="space-y-4">
-          <div className="flex overflow-x-auto overflow-y-hidden whitespace-nowrap -mx-1 px-1 scrollbar-none sm:overflow-visible sm:whitespace-normal">
+          <ScrollableRow>
             {title.seasons.map((sn) => (
               <Link
                 key={sn.number}
                 to="/watch/$id"
                 params={{ id }}
                 search={{ s: sn.number, e: undefined, party: partyCode ?? undefined }}
-                className={`rounded-full border px-4 py-1.5 text-xs font-medium transition-colors ${
+                className={`shrink-0 rounded-full border px-4 py-1.5 text-xs font-medium transition-colors ${
                   sn.number === activeSeason.number
                     ? "border-primary bg-primary text-primary-foreground"
                     : "border-border text-muted-foreground hover:border-primary/50"
@@ -1424,7 +1425,7 @@ function WatchPage() {
                 {sn.name}
               </Link>
             ))}
-          </div>
+          </ScrollableRow>
           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
             {activeSeason.episodes.map((ep) => (
               <Link

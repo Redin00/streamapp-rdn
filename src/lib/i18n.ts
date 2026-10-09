@@ -187,7 +187,7 @@ export const EN = {
   admin_setProfilePictureDescription: "Upload or paste a URL for the user's profile picture.",
   dashboard_recentlyAdded: "Recently added",
   dashboard_sampleNotice:
-    "Showing sample catalogue data. Connect your StreamingCommunity service to load real titles.",
+    "Showing sample catalogue data. Connect your backend service to load real titles.",
   watch_backToDetails: "Back to details",
   watch_resume: "Resume",
   watch_resumeTitle: "Resume watching",
@@ -205,8 +205,7 @@ export const EN = {
   library_notLoaded:
     "The streaming service isn't answering, so this profile's library can't be loaded.",
   library_everythingSavedOrPlayed: "Everything this profile saved or played.",
-  footer_caption:
-    "StreamApp - Rdn - catalogue data served through your StreamingCommunity service.",
+  footer_caption: "StreamApp - Rdn - Made by Redinn",
   titlecard_film: "Film",
   titlecard_series: "Series",
   adblock_forBrowser: "for ",
@@ -446,7 +445,7 @@ export const IT = {
   admin_resetError: "Impossibile reimpostare la password.",
   dashboard_recentlyAdded: "Aggiunti recentemente",
   dashboard_sampleNotice:
-    "Visualizzazione dati di catalogo di esempio. Connetti il servizio StreamingCommunity per caricare i titoli reali.",
+    "Visualizzazione dati di catalogo di esempio. Connetti il servizio backend per caricare i titoli reali.",
   watch_backToDetails: "Torna ai dettagli",
   watch_resume: "Riprendi",
   watch_resumeTitle: "Riprendi visione",
@@ -464,8 +463,7 @@ export const IT = {
   library_notLoaded:
     "Il servizio di streaming non risponde, la libreria di questo profilo non puo' essere caricata.",
   library_everythingSavedOrPlayed: "Tutto cio' che questo profilo ha salvato o guardato.",
-  footer_caption:
-    "StreamApp - Rdn - dati di catalogo serviti tramite il tuo servizio StreamingCommunity.",
+  footer_caption: "StreamApp - Rdn - Made by Redinn",
   titlecard_film: "Film",
   titlecard_series: "Serie",
   admin_clearAllDataConfirm: "Sì, cancella tutti i dati",

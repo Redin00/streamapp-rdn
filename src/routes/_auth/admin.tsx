@@ -79,11 +79,23 @@ export const Route = createFileRoute("/_auth/admin")({
   beforeLoad: ({ context }) => {
     if (context.viewer.role !== "admin") throw redirect({ to: "/" });
   },
-  loader: ({ context }) =>
-    Promise.all([
-      context.queryClient.ensureQueryData(accountsQuery),
-      context.queryClient.ensureQueryData(domainSettingsQuery),
-    ]),
+  loader: async ({ context }) => {
+    try {
+      return await Promise.all([
+        context.queryClient.ensureQueryData(accountsQuery),
+        context.queryClient.ensureQueryData(domainSettingsQuery),
+      ]);
+    } catch (err: unknown) {
+      const isUnauthorized =
+        (err as { status?: number })?.status === 401 ||
+        (err instanceof Error && err.message.toLowerCase().includes("not signed in"));
+      if (isUnauthorized) {
+        context.queryClient.setQueryData(["viewer"], null);
+        throw redirect({ to: "/login", replace: true });
+      }
+      throw err;
+    }
+  },
   component: AdminPage,
 });
 
@@ -123,34 +135,10 @@ function AdminPage() {
       if (result.checked) {
         await queryClient.invalidateQueries({ queryKey: domainSettingsQuery.queryKey });
         if (result.redirected) {
-          const scChanged = result.sc?.redirected && result.sc.currentDomain;
-          const vixChanged = result.vixsrc?.redirected && result.vixsrc.currentDomain;
-
-          let msg = "";
-          if (scChanged && vixChanged) {
-            msg = t("admin_domainsRedirectDetectedBoth")
-              .replace("{scDomain}", result.sc?.currentDomain ?? "")
-              .replace("{vixsrcDomain}", result.vixsrc?.currentDomain ?? "");
-          } else if (scChanged) {
-            msg = t("admin_domainsRedirectDetectedSc").replace(
-              "{domain}",
-              result.sc?.currentDomain ?? "",
-            );
-          } else if (vixChanged) {
-            msg = t("admin_domainsRedirectDetectedVixsrc").replace(
-              "{domain}",
-              result.vixsrc?.currentDomain ?? "",
-            );
-          } else {
-            msg = t("admin_domainsRedirectDetected").replace(
-              "{domain}",
-              result.currentDomain ?? "",
-            );
-          }
-
+          const newDomain = result.vixsrc?.currentDomain ?? result.currentDomain ?? result.currentVixsrcDomain ?? "";
           setRedirectMessage({
             type: "success",
-            text: msg,
+            text: t("admin_domainsRedirectDetectedVixsrc").replace("{domain}", newDomain),
           });
         } else {
           setRedirectMessage({
@@ -181,9 +169,8 @@ function AdminPage() {
     event.preventDefault();
     setRedirectMessage(null);
     const form = event.currentTarget;
-    const scDomain = (form.elements.namedItem("scDomain") as HTMLInputElement).value;
     const vixsrcDomain = (form.elements.namedItem("vixsrcDomain") as HTMLInputElement).value;
-    const result = await updateDomainSettings({ data: { scDomain, vixsrcDomain } });
+    const result = await updateDomainSettings({ data: { vixsrcDomain } });
     if (!result.ok) {
       setError(result.message ?? t("misc_error"));
       return;
@@ -362,19 +349,7 @@ function AdminPage() {
             <p className="text-sm text-muted-foreground">{t("admin_domainsDescription")}</p>
           </div>
         </div>
-        <form onSubmit={handleDomainSettings} className="grid gap-4 sm:grid-cols-2">
-          <div className="space-y-2">
-            <Label htmlFor="admin-scDomain">{t("admin_catalogueDomain")}</Label>
-            <Input
-              key={(domainSettings as DomainSettings).scDomain}
-              id="admin-scDomain"
-              name="scDomain"
-              defaultValue={(domainSettings as DomainSettings).scDomain}
-              placeholder="streamingcommunity.example"
-              className="font-mono"
-              required
-            />
-          </div>
+        <form onSubmit={handleDomainSettings} className="grid gap-4">
           <div className="space-y-2">
             <Label htmlFor="admin-vixsrcDomain">{t("admin_playbackDomain")}</Label>
             <Input
@@ -382,15 +357,15 @@ function AdminPage() {
               id="admin-vixsrcDomain"
               name="vixsrcDomain"
               defaultValue={(domainSettings as DomainSettings).vixsrcDomain}
-              placeholder="vixsrc.example"
-              className="font-mono"
+              placeholder="vixsrc.to"
+              className="font-mono max-w-md"
               required
             />
           </div>
 
           {redirectMessage ? (
             <div
-              className={`sm:col-span-2 rounded-lg border p-3 text-sm ${
+              className={`rounded-lg border p-3 text-sm ${
                 redirectMessage.type === "success"
                   ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
                   : redirectMessage.type === "error"
@@ -402,7 +377,7 @@ function AdminPage() {
             </div>
           ) : null}
 
-          <div className="flex flex-wrap items-center gap-3 sm:col-span-2">
+          <div className="flex flex-wrap items-center gap-3">
             <Button type="submit" className="gap-2">
               <Globe className="size-4" />
               {t("admin_domainsSave")}

@@ -10,11 +10,10 @@ class TestCacheAndProtection(unittest.TestCase):
     def setUp(self):
         main._cache.clear()
         main.clear_db_cache()
-        self.orig_sc = main.SC_DOMAIN
         self.orig_vix = main.VIXSRC_DOMAIN
 
     def tearDown(self):
-        main.configure_domains(self.orig_sc, self.orig_vix)
+        main.configure_domains(self.orig_vix)
         main._cache.clear()
         main.clear_db_cache()
 
@@ -51,36 +50,34 @@ class TestCacheAndProtection(unittest.TestCase):
 
     def test_configure_domains_preserves_cache_if_domain_unchanged(self):
         main._cache["my_key"] = (1000000000.0, "value")
-        main.configure_domains(main.SC_DOMAIN, "different-vixsrc.to")
+        main.configure_domains(main.VIXSRC_DOMAIN)
         self.assertIn("my_key", main._cache)
 
     def test_configure_domains_clears_cache_if_domain_changed(self):
         main._cache["my_key"] = (1000000000.0, "value")
-        main.configure_domains("brand-new-sc-domain.org", main.VIXSRC_DOMAIN)
+        main.configure_domains("brand-new-vixsrc-domain.org")
         self.assertNotIn("my_key", main._cache)
 
     @patch("main.requests.get")
-    def test_check_domain_redirect_throttle(self, mock_get):
+    def test_check_vixsrc_redirect_throttle(self, mock_get):
         mock_resp = MagicMock()
-        mock_resp.url = f"https://{main.SC_DOMAIN}/"
-        mock_resp.text = "<html>StreamingCommunity</html>"
+        mock_resp.url = f"https://{main.VIXSRC_DOMAIN}/"
+        mock_resp.text = "<html>vixsrc player</html>"
         mock_resp.status_code = 200
         mock_get.return_value = mock_resp
 
         # First check runs
-        res1 = main.check_domain_redirect()
+        res1 = main.check_vixsrc_redirect()
         self.assertTrue(res1["checked"])
         self.assertEqual(mock_get.call_count, 1)
 
         # Immediate second check should be throttled
-        res2 = main.check_domain_redirect()
+        res2 = main.check_vixsrc_redirect()
         self.assertFalse(res2["checked"])
         self.assertTrue(res2.get("cooldown"))
-        # requests.get should not have been called again
         self.assertEqual(mock_get.call_count, 1)
 
         # Third check with force=True should bypass throttle
-        res3 = main.check_domain_redirect(force=True)
+        res3 = main.check_vixsrc_redirect(force=True)
         self.assertTrue(res3["checked"])
         self.assertEqual(mock_get.call_count, 2)
-

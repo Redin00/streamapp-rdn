@@ -11,6 +11,7 @@ import {
   removeWatchMarker,
   formatWatchPosition,
 } from "@/lib/library.functions";
+import { ScrollableRow } from "@/components/ScrollableRow";
 import { getTitle } from "@/lib/streaming.functions";
 
 const titleQuery = (id: string) =>
@@ -257,12 +258,12 @@ function TitlePage() {
 
       {data.seasons.length > 0 ? (
         <section className="space-y-4">
-          <div className="flex overflow-x-auto overflow-y-hidden whitespace-nowrap -mx-1 px-1 scrollbar-none sm:overflow-visible sm:whitespace-normal">
+          <ScrollableRow>
             {data.seasons.map((s) => (
               <button
                 key={s.number}
                 onClick={() => setSeason(s.number)}
-                className={`rounded-full border px-4 py-1.5 text-xs font-medium transition-colors ${
+                className={`shrink-0 rounded-full border px-4 py-1.5 text-xs font-medium transition-colors ${
                   season === s.number
                     ? "border-primary bg-primary text-primary-foreground"
                     : "border-border text-muted-foreground hover:border-primary/50"
@@ -271,7 +272,7 @@ function TitlePage() {
                 {s.name}
               </button>
             ))}
-          </div>
+          </ScrollableRow>
           <ul className="divide-y divide-border overflow-hidden rounded-xl border border-border bg-card">
             {(current?.episodes ?? []).map((ep) => (
               <li key={ep.id}>

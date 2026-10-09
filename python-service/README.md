@@ -1,7 +1,7 @@
-# StreamApp - Rdn — Python service
+# StreamApp - Rdn — Python Service
 
-Small FastAPI wrapper around [`streamingcommunity-unofficialapi`](https://pypi.org/project/streamingcommunity-unofficialapi/)
-(module `scuapi`). It serves exactly the JSON the dashboard reads.
+FastAPI backend service powering the streaming dashboard.
+Integrates **The Movie Database (TMDB)** for rich metadata and **Vixsrc** for catalogue availability and direct HLS streaming playback.
 
 ## Run locally
 
@@ -12,72 +12,48 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
-Check it: `curl localhost:8000/health` then `curl "localhost:8000/search?q=dark"`.
+Verify the service:
+```bash
+curl localhost:8000/health
+```
 
 ## Or with Docker
 
 ```bash
 docker build -t streaming-api python-service
-docker run -p 8000:8000 streaming-api
+docker run -p 8000:8000 -e TMDB_API_KEY=your_key streaming-api
 ```
 
 ## Connect the dashboard
 
 Set the environment variable `STREAMING_API_URL` for the web app to the service
-URL (e.g. `http://localhost:8000`). Without it the app keeps showing its sample
-catalogue.
+URL (e.g. `http://localhost:8000`).
 
 For local development, configure the service from the repository-root `.env`
 file. Copy `../.env.example` to `../.env`; `npm run dev` loads it automatically.
+
+Make sure to set `TMDB_API_KEY` in `.env` (free at https://www.themoviedb.org/settings/api).
 
 ## Endpoints
 
 | Endpoint          | Returns                                     | Source                         |
 | ----------------- | ------------------------------------------- | ------------------------------ |
-| `GET /health`     | `{ ok, domain }`                            | —                              |
-| `GET /player`     | `{ provider, domain, enabled }`             | —                              |
-| `GET /stream`     | `{ provider, playlistUrl, expiresAt, fhd }` | playback host API + scrape     |
-| `GET /search?q=`  | `TitleSummary[]`                            | `API.search()`                 |
-| `GET /trending`   | `TitleSummary[]`                            | site `/it/browse/trending`     |
-| `GET /latest`     | `TitleSummary[]`                            | site `/it/browse/latest`       |
-| `GET /title/{id}` | `TitleDetail` (seasons, episodes, `tmdbId`) | `API.load()`                   |
-| `GET /stats`      | `LibraryStats`                              | browse sliders + archive total |
+| `GET /health`     | `{ ok, domain, tmdb_configured, ... }`      | —                              |
+| `GET /player`     | `{ provider, domain, enabled }`             | Vixsrc host                    |
+| `GET /stream`     | `{ provider, playlistUrl, expiresAt, fhd }` | Vixsrc API + token scrape      |
+| `GET /search?q=`  | `TitleSummary[]`                            | TMDB Multi Search              |
+| `GET /trending`   | `TitleSummary[]`                            | TMDB Trending filtered/sorted  |
+| `GET /latest`     | `TitleSummary[]`                            | TMDB Now Playing & Airing      |
+| `GET /title/{id}` | `TitleDetail` (seasons, episodes, `tmdbId`) | TMDB Movie/TV details          |
+| `GET /stats`      | `LibraryStats`                              | Vixsrc catalogue size          |
 
-`{id}` is the `"<numeric-id>-<slug>"` value returned in each summary's `slug`.
+`{id}` is the numeric TMDB id or the slug formatted as `"<tmdbId>-<title>"`.
 
-## Notes
+## Architecture Notes
 
-- The upstream site rotates its domain; if everything 502s, update the catalogue
-  domain from the admin panel.
-- Listings come from the site's own page routes: asking `/it/browse/{slider}` for
-  `application/json` returns the payload it would otherwise render. `trending`,
-  `latest` and `top10` are the sliders, `/it/browse/genre?g=<name>` filters by
-  genre, and each carries at most 60 titles. `api/tv/browse` needs credentials
-  and `scuapi` has no browse method, so there is no cleaner route.
-- Those payloads carry no genres, so summaries from `/trending`, `/latest` and
-  `/search` come back with `genres: []` and `/stats` reports an empty
-  `genreBreakdown`. Genres are only available per title, from `API.load()`.
-- `/stats` takes `totalTitles`, `movies` and `series` from the paginated
-  `/it/archive?type=` endpoint, because counting the sliders would report a
-  library of ~100 titles instead of the real tens of thousands.
-- Playback is keyed by TMDB id and served to the dashboard via `GET /player`
-  (embed host) and `GET /stream?tmdb=&type=movie|tv[&s=&e=]` (direct playlist).
-  The host comes from the playback domain in the admin panel (default `vixsrc.to`).
-- `API.get_links()` is deliberately unused: it scrapes `window.masterPlaylist`
-  from the host's public `/movie/{tmdb}` and `/tv/{tmdb}/{s}/{e}` pages, which no
-  longer contain it. `resolve_playlist()` instead calls the host's private
-  `/api/{movie,tv}/...` JSON endpoint and scrapes the token'd `/embed/...` page it
-  returns.
-- The embed token lives ~2 minutes, so both hops run back to back; the playlist
-  token it yields lasts ~60 days, which is why caching it for `SC_CACHE_TTL` is
-  safe. Titles the host does not carry return `404` and scrape failures `502`, so
-  the dashboard can fall back to the iframe embed.
-- If the host ever starts signing playlists to a network, `resolve_playlist()`
-  logs a warning about a non-empty `asn` param — server-side resolving would then
-  hand the browser a playlist it cannot use.
-- Set `SC_LOG_LEVEL=DEBUG` for cache-hit and upstream-request tracing.
-- Responses are cached in-process for `SC_CACHE_TTL` seconds (default 600).
-- `cast` and `quality` are not exposed upstream, so they are left empty/`"HD"`.
-- The site publishes no view analytics and no catalogue-wide rating aggregate:
-  `weeklyViews` is scaled from the sampled titles and `averageScore` is averaged
-  over them, so both describe the sample rather than the whole library.
+- **Metadata**: Titles, posters, descriptions, release years, vote ratings, cast, genres, and TV seasons/episodes are obtained from TMDB in Italian (`it-IT`).
+- **Availability & Playback**: Vixsrc indexes available Italian movies (`/api/list/movie?lang=it`), series (`/api/list/tv?lang=it`), and episodes (`/api/list/episode?lang=it`).
+- **Direct Stream Extraction**: `resolve_playlist()` calls Vixsrc's private `/api/{movie,tv}/...` JSON endpoint, fetches the token'd `/embed/...` page, and parses `window.masterPlaylist`. The resulting token lasts ~60 days, while the embed token lives ~2 minutes.
+- **Cache**: Responses and playlists are cached in-memory and persistently in SQLite (`streamapp.db`), with configurable TTL (`SC_CACHE_TTL`, default 1800s).
+- **Domain Rotation & Precedence**: Vixsrc domain rotation is monitored and updated dynamically via `check_vixsrc_redirect()`. The initial host is configured via `SC_VIXSRC_DOMAIN` in `.env` (default `vixsrc.to`). Once modified from `/admin` or updated via an automatic redirect, the active domain is stored in SQLite (`app_settings`) and takes precedence over `.env`.
+

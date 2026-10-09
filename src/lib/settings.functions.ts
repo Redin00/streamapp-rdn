@@ -4,7 +4,6 @@ import { z } from "zod";
 import { messageFor, serviceFetch } from "./service";
 
 export type DomainSettings = {
-  scDomain: string;
   vixsrcDomain: string;
 };
 
@@ -21,7 +20,7 @@ export const getDomainSettings = createServerFn({ method: "GET" }).handler(
 );
 
 export const updateDomainSettings = createServerFn({ method: "POST" })
-  .validator((data) => z.object({ scDomain: domain, vixsrcDomain: domain }).parse(data))
+  .validator((data) => z.object({ vixsrcDomain: domain }).parse(data))
   .handler(async ({ data }): Promise<{ ok: boolean; message?: string }> => {
     try {
       await serviceFetch<DomainSettings>("/settings/domains", {
