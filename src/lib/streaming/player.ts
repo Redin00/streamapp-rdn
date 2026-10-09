@@ -8,6 +8,8 @@ export interface EmbedTarget {
   startAt?: number | undefined;
   /** When provided, appends ?autoplay=1 or ?autoplay=0 to force playback state on load */
   autoplay?: boolean | undefined;
+  /** Audio/subtitle preferred language (e.g. 'it', 'en'). Defaults to 'it'. */
+  lang?: string | undefined;
 }
 
 /**
@@ -33,6 +35,10 @@ export function buildEmbedUrl(config: PlayerConfig, target: EmbedTarget): string
   }
   if (target.autoplay !== undefined) {
     url.searchParams.set("autoplay", target.autoplay ? "true" : "false");
+  }
+  const lang = target.lang;
+  if (lang) {
+    url.searchParams.set("lang", lang);
   }
   return url.toString();
 }

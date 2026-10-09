@@ -104,6 +104,7 @@ export const getStreamSource = createServerFn({ method: "GET" })
         type: z.enum(["movie", "tv"]),
         season: z.number().int().positive().optional(),
         episode: z.number().int().positive().optional(),
+        lang: z.string().optional(),
       })
       .parse(data),
   )
@@ -111,9 +112,7 @@ export const getStreamSource = createServerFn({ method: "GET" })
     const query = new URLSearchParams({ tmdb: String(data.tmdbId), type: data.type });
     if (data.season) query.set("s", String(data.season));
     if (data.episode) query.set("e", String(data.episode));
-    // Direct HLS resolution happens from the Python service, so a failure may
-    // be caused by the service host being blocked even when the browser embed
-    // still works. Return null so the watch page can use its iframe fallback.
+    query.set("lang", data.lang || "it");
     const live = await upstream<StreamSource>(`/stream?${query}`);
     if (live) return live;
     return null;

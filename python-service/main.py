@@ -692,15 +692,19 @@ def _scrape(pattern: str, page: str, what: str) -> str:
 
 
 def resolve_playlist(
-    tmdb_id: int, media_type: str, season: Optional[int] = None, episode: Optional[int] = None
+    tmdb_id: int,
+    media_type: str,
+    season: Optional[int] = None,
+    episode: Optional[int] = None,
+    lang: str = "it",
 ) -> Optional[Dict[str, Any]]:
     """Resolve a playable HLS master playlist from Vixsrc."""
     base = f"https://{VIXSRC_DOMAIN}"
     kind = "tv" if media_type == "tv" else "movie"
     suffix = f"/{season}/{episode}" if season and episode else ""
-    referer = f"{base}/{kind}/{tmdb_id}{suffix}"
+    referer = f"{base}/{kind}/{tmdb_id}{suffix}?lang={lang}"
 
-    api_path = f"/api/{kind}/{tmdb_id}{suffix}"
+    api_path = f"/api/{kind}/{tmdb_id}{suffix}?lang={lang}"
     log.debug("resolve GET %s%s", base, api_path)
     try:
         res = vixsrc_session.get(base + api_path, headers={"referer": referer}, timeout=20)
@@ -852,6 +856,7 @@ def stream(
     type: str = Query("movie", pattern="^(movie|tv)$"),
     s: Optional[int] = Query(None, gt=0),
     e: Optional[int] = Query(None, gt=0),
+    lang: str = Query("it"),
 ):
     """Direct HLS master playlist resolved from Vixsrc."""
     if not VIXSRC_DOMAIN:
@@ -861,7 +866,8 @@ def stream(
 
     try:
         resolved = cached(
-            f"stream:{type}:{tmdb}:{s}:{e}", lambda: resolve_playlist(tmdb, type, s, e)
+            f"stream:{type}:{tmdb}:{s}:{e}:{lang}",
+            lambda: resolve_playlist(tmdb, type, s, e, lang=lang),
         )
     except HTTPException:
         raise

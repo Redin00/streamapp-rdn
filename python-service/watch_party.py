@@ -132,6 +132,7 @@ class MediaPayload(BaseModel):
     season: Optional[int] = None
     episode: Optional[int] = None
     titleName: Optional[str] = None
+    lang: Optional[str] = None
 
 
 class CreatePartyRequest(BaseModel):
@@ -418,6 +419,16 @@ async def apply_room_event(
             try:
                 new_media = MediaPayload(**new_media_raw)
                 time_val = float(msg.get("time", 0.0))
+                # If changing media (different slug, season, or episode), always reset time to 0.0
+                is_different_media = (
+                    room.media is None
+                    or new_media.slug != room.media.slug
+                    or new_media.season != room.media.season
+                    or new_media.episode != room.media.episode
+                )
+                if is_different_media:
+                    time_val = 0.0
+
                 async with room.lock:
                     room.media = new_media
                     room.state.time = time_val

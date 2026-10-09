@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, createFileRoute, notFound } from "@tanstack/react-router";
 import { queryOptions, useQuery, useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
-import { ArrowLeft, Loader2, Maximize, Minimize, Pause, Play, Users } from "lucide-react";
+import { ArrowLeft, ChevronDown, Languages, Loader2, Maximize, Minimize, Pause, Play, Users } from "lucide-react";
 import { z } from "zod";
 
 import { HlsPlayer, type HlsPlayerHandle } from "@/components/HlsPlayer";
@@ -9,6 +9,12 @@ import { AdBlockPrompt, useAdBlockPrompt } from "@/components/AdBlockPrompt";
 import { WatchTogetherDialog } from "@/components/WatchTogetherDialog";
 import { ScrollableRow } from "@/components/ScrollableRow";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { useBrowserInfo } from "@/hooks/use-browser-info";
 import { historyQuery } from "@/lib/auth/queries";
 import type { WatchEntry } from "@/lib/auth/types";
@@ -102,7 +108,7 @@ function WatchPage() {
   const queryClient = useQueryClient();
   const { data: title } = useSuspenseQuery(titleQuery(id));
   const { data: player } = useSuspenseQuery(playerQuery);
-  const { t } = useTranslation();
+  const { t, locale } = useTranslation();
 
   const isSeries = title?.type === "tv";
   const activeSeason = isSeries
@@ -118,8 +124,13 @@ function WatchPage() {
   const { browser: detectedBrowser, adblockActive } = useBrowserInfo();
   const adBlockPrompt = useAdBlockPrompt({ browser: detectedBrowser, adblockActive });
 
+  // Default audio language automatically follows the site's selected language (it/en)
+  const siteLang = locale === "en" ? "en" : "it";
+  const [selectedLang, setSelectedLang] = useState<string>(siteLang);
+  const partyLangRef = useRef<string>(siteLang);
+
   const streamQuery = useQuery({
-    queryKey: ["stream", title?.tmdbId, title?.type, activeSeason?.number, activeEpisode?.number],
+    queryKey: ["stream", title?.tmdbId, title?.type, activeSeason?.number, activeEpisode?.number, selectedLang],
     queryFn: () => {
       if (!title?.tmdbId) return null;
       return getStreamSource({
@@ -128,6 +139,7 @@ function WatchPage() {
           type: title.type,
           season: activeSeason?.number,
           episode: activeEpisode?.number,
+          lang: selectedLang,
         },
       });
     },
@@ -143,6 +155,7 @@ function WatchPage() {
         type: title.type,
         season: activeSeason?.number,
         episode: activeEpisode?.number,
+        lang: selectedLang,
       })
     : null;
 
@@ -252,12 +265,13 @@ function WatchPage() {
 
   // Helper to safely re-generate the iframe embed URL and remount the iframe for Vixsrc
   const reloadVixsrc = useCallback(
-    (startAt?: number, autoplay?: boolean) => {
+    (startAt?: number, autoplay?: boolean, forcedLang?: string) => {
       if (!title?.tmdbId || !player) return;
       const targetTime =
         typeof startAt === "number" && Number.isFinite(startAt) && startAt > 0
           ? Math.floor(startAt)
           : undefined;
+      const langToUse = forcedLang || selectedLang || (locale === "en" ? "en" : "it");
       const nextUrl = buildEmbedUrl(player, {
         tmdbId: title.tmdbId,
         type: title.type,
@@ -265,6 +279,7 @@ function WatchPage() {
         episode: activeEpisode?.number,
         startAt: targetTime,
         autoplay,
+        lang: langToUse,
       });
       if (nextUrl) {
         lastRemoteReloadRef.current = Date.now();
@@ -280,7 +295,7 @@ function WatchPage() {
         });
       }
     },
-    [title, player, activeSeason?.number, activeEpisode?.number],
+    [title, player, activeSeason?.number, activeEpisode?.number, selectedLang, locale],
   );
 
   const isLeavingPartyRef = useRef(false);
@@ -386,6 +401,7 @@ function WatchPage() {
         (targetSeason !== currentSeason || targetEpisode !== currentEpisode);
 
       if (isDifferentSlug || isDifferentEpisode) {
+        latestSecondsRef.current = 0;
         const code = (roomCode || partyCode || searchPartyCode || "").trim().toUpperCase();
         if (code) {
           try {
@@ -449,7 +465,24 @@ function WatchPage() {
     getIsPlaying,
   });
 
-  // Guest auto-synchronizes to host's movie/episode whenever room is loaded or changes
+  const isRoomMatchingMedia = Boolean(
+    party.room?.media &&
+      party.room.media.slug === slug &&
+      (party.room.media.type !== "tv" ||
+        ((party.room.media.season ?? 1) === (activeSeason?.number ?? 1) &&
+          (party.room.media.episode ?? 1) === (activeEpisode?.number ?? 1))),
+  );
+
+  const currentMediaKey = `${slug}:${season}:${episode}`;
+  const activeMediaKeyRef = useRef(currentMediaKey);
+  useEffect(() => {
+    if (activeMediaKeyRef.current !== currentMediaKey) {
+      activeMediaKeyRef.current = currentMediaKey;
+      latestSecondsRef.current = 0;
+    }
+  }, [currentMediaKey]);
+
+  // Guest auto-synchronizes to host's movie/episode/language whenever room is loaded or changes
   useEffect(() => {
     if (!party.room || party.isHost) return;
     const media = party.room.media;
@@ -465,6 +498,7 @@ function WatchPage() {
       (targetSeason !== currentSeason || targetEpisode !== currentEpisode);
 
     if (isDifferentSlug || isDifferentEpisode) {
+      latestSecondsRef.current = 0;
       console.info("Syncing guest to host media:", media.slug, targetSeason, targetEpisode);
       const code = (party.room.code || partyCode || searchPartyCode || "").trim().toUpperCase();
       if (code) {
@@ -481,15 +515,40 @@ function WatchPage() {
           party: code || undefined,
         },
       });
+      return;
     }
-  }, [party.room, party.isHost, slug, activeSeason?.number, activeEpisode?.number, navigate, partyCode, searchPartyCode]);
 
-  // Host broadcasts media changes when switching episodes
+    const isDifferentLang = Boolean(media.lang && media.lang !== selectedLang);
+    if (isDifferentLang) {
+      setSelectedLang(media.lang!);
+      partyLangRef.current = media.lang!;
+      const cur = latestSecondsRef.current ?? party.room.state.time ?? 0;
+      reloadVixsrc(cur > 0 ? cur : undefined, isLocalPlaying, media.lang!);
+    }
+  }, [party.room, party.isHost, slug, activeSeason?.number, activeEpisode?.number, navigate, partyCode, searchPartyCode, selectedLang, isLocalPlaying, reloadVixsrc]);
+
+  // Host broadcasts media changes when switching episodes or language
   useEffect(() => {
     if (!party.isHost || !party.room || !title) return;
-    const mediaKey = `${slug}:${season}:${episode}`;
+    const mediaKey = `${slug}:${season}:${episode}:${selectedLang}`;
     if (lastBroadcastMediaRef.current === mediaKey) return;
+
+    const prevMedia = party.room.media;
+    const isDifferentMedia =
+      !prevMedia ||
+      prevMedia.slug !== slug ||
+      (title.type === "tv" &&
+        ((prevMedia.season ?? 1) !== (activeSeason?.number ?? 1) ||
+         (prevMedia.episode ?? 1) !== (activeEpisode?.number ?? 1)));
+
     lastBroadcastMediaRef.current = mediaKey;
+
+    // When switching to a different episode or title, timestamp must reset to 0
+    const timeToSend = isDifferentMedia ? 0 : (latestSecondsRef.current ?? 0);
+    if (isDifferentMedia) {
+      latestSecondsRef.current = 0;
+    }
+
     party.sendChangeMedia(
       {
         slug,
@@ -498,10 +557,48 @@ function WatchPage() {
         season: activeSeason?.number,
         episode: activeEpisode?.number,
         titleName: title.name,
+        lang: selectedLang,
       },
-      latestSecondsRef.current ?? 0,
+      timeToSend,
     );
-  }, [party.isHost, party.room, party.sendChangeMedia, slug, season, episode, title, activeSeason, activeEpisode]);
+  }, [party.isHost, party.room, party.sendChangeMedia, slug, season, episode, selectedLang, title, activeSeason, activeEpisode]);
+
+  const handleLanguageChange = useCallback(
+    (newLang: string) => {
+      setSelectedLang(newLang);
+      partyLangRef.current = newLang;
+
+      const curTime = latestSecondsRef.current ?? party.room?.state?.time ?? 0;
+      if (party.isHost && party.room && title) {
+        party.sendChangeMedia(
+          {
+            slug,
+            tmdbId: title.tmdbId,
+            type: title.type,
+            season: activeSeason?.number,
+            episode: activeEpisode?.number,
+            titleName: title.name,
+            lang: newLang,
+          },
+          curTime,
+        );
+      }
+
+      reloadVixsrc(curTime > 0 ? curTime : undefined, isLocalPlaying, newLang);
+    },
+    [party.isHost, party.room, party.sendChangeMedia, title, slug, activeSeason?.number, activeEpisode?.number, reloadVixsrc, isLocalPlaying],
+  );
+
+  // Automatically update video audio language when the site's locale is switched
+  const prevLocaleRef = useRef(locale);
+  useEffect(() => {
+    if (prevLocaleRef.current !== locale) {
+      prevLocaleRef.current = locale;
+      if (!party.room || party.isHost) {
+        handleLanguageChange(locale);
+      }
+    }
+  }, [locale, party.room, party.isHost, handleLanguageChange]);
 
   const handleCreateParty = async () => {
     if (!title || isCreatingParty) return;
@@ -524,6 +621,7 @@ function WatchPage() {
             season: activeSeason?.number ?? null,
             episode: activeEpisode?.number ?? null,
             titleName: title.name,
+            lang: selectedLang,
           },
           initialTime,
           guestId,
@@ -582,8 +680,12 @@ function WatchPage() {
       }
 
       party.setRoom(res.room);
+      if (res.room.media?.lang && res.room.media.lang !== selectedLang) {
+        setSelectedLang(res.room.media.lang);
+        partyLangRef.current = res.room.media.lang;
+      }
       if (res.room.state?.time && res.room.state.time > 0 && res.room.state.isPlaying && !playlistUrl) {
-        reloadVixsrc(res.room.state.time, true);
+        reloadVixsrc(res.room.state.time, true, res.room.media?.lang || undefined);
       }
       const targetMedia = res.room.media;
       if (targetMedia && targetMedia.slug) {
@@ -595,6 +697,7 @@ function WatchPage() {
           (targetSeason !== activeSeason?.number || targetEpisode !== activeEpisode?.number);
 
         if (isDiffSlug || isDiffEp) {
+          latestSecondsRef.current = 0;
           void navigate({
             to: "/watch/$id",
             params: { id: targetMedia.slug },
@@ -653,10 +756,11 @@ function WatchPage() {
     if (searchPartyCode && !party.room && !party.error) return;
 
     initialVixsrcLoadedRef.current = mediaKey;
-    const initialStart =
-      party.room?.state?.time && party.room.state.time > 0
-        ? party.room.state.time
-        : (marker ?? undefined);
+    const initialStart = party.room
+      ? (isRoomMatchingMedia && party.room.state?.time && party.room.state.time > 0
+          ? party.room.state.time
+          : undefined)
+      : (marker ?? undefined);
     const initialAutoplay = party.room ? party.room.state.isPlaying : undefined;
     if (party.room) {
       setIsLocalPlaying(party.room.state.isPlaying);
@@ -673,6 +777,7 @@ function WatchPage() {
     searchPartyCode,
     party.room,
     party.error,
+    isRoomMatchingMedia,
     marker,
     reloadVixsrc,
   ]);
@@ -752,6 +857,7 @@ function WatchPage() {
           // Ignore quota/storage errors — the server write is the source of truth.
         }
       }
+      latestSecondsRef.current = 0;
     };
   }, [slug, title, season, episode]);
 
@@ -1218,6 +1324,29 @@ function WatchPage() {
             </Button>
           ) : null}
 
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5 text-xs font-medium"
+                title="Seleziona lingua audio"
+              >
+                <Languages className="size-3.5" />
+                <span>Audio: {selectedLang === "it" ? "Italiano" : selectedLang === "en" ? "English" : selectedLang.toUpperCase()}</span>
+                <ChevronDown className="size-3 opacity-60" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onClick={() => handleLanguageChange("it")}>
+                🇮🇹 Italiano {selectedLang === "it" && "✓"}
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => handleLanguageChange("en")}>
+                🇬🇧 English {selectedLang === "en" && "✓"}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+
           <Button
             variant="outline"
             size="sm"
@@ -1301,8 +1430,10 @@ function WatchPage() {
               }
             }}
             initialSeconds={
-              party.room?.state?.time && party.room.state.time > 0
-                ? party.room.state.time
+              party.room
+                ? (isRoomMatchingMedia && party.room.state?.time && party.room.state.time > 0
+                    ? party.room.state.time
+                    : undefined)
                 : (marker ?? undefined)
             }
           />

@@ -5,6 +5,7 @@ export interface PartyMedia {
   season?: number | null | undefined;
   episode?: number | null | undefined;
   titleName?: string | undefined;
+  lang?: string | null | undefined;
 }
 
 export interface PartyMember {
