@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, createFileRoute, notFound } from "@tanstack/react-router";
 import { queryOptions, useQuery, useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
-import { ArrowLeft, ChevronDown, Languages, Loader2, Maximize, Minimize, Pause, Play, Users } from "lucide-react";
+import { ArrowLeft, CheckCircle2, ChevronDown, Languages, Loader2, Maximize, Minimize, Pause, Play, RotateCcw, Users } from "lucide-react";
 import { z } from "zod";
 
 import { HlsPlayer, type HlsPlayerHandle } from "@/components/HlsPlayer";
@@ -118,6 +118,42 @@ function WatchPage() {
     ? (activeSeason?.episodes.find((x) => x.number === e) ?? activeSeason?.episodes[0])
     : undefined;
 
+  const nextEpisode = useMemo(() => {
+    if (!activeSeason || !activeEpisode) return null;
+    const currentIndex = activeSeason.episodes.findIndex(
+      (ep) => ep.number === activeEpisode.number,
+    );
+    if (currentIndex >= 0 && currentIndex < activeSeason.episodes.length - 1) {
+      const nextEp = activeSeason.episodes[currentIndex + 1];
+      if (nextEp) {
+        return {
+          seasonNumber: activeSeason.number,
+          episodeNumber: nextEp.number,
+          name: nextEp.name,
+        };
+      }
+    }
+    if (title && title.seasons) {
+      const currentSeasonIndex = title.seasons.findIndex(
+        (sn) => sn.number === activeSeason.number,
+      );
+      if (currentSeasonIndex >= 0 && currentSeasonIndex < title.seasons.length - 1) {
+        const nextSeason = title.seasons[currentSeasonIndex + 1];
+        if (nextSeason && nextSeason.episodes && nextSeason.episodes.length > 0) {
+          const firstEp = nextSeason.episodes[0];
+          if (firstEp) {
+            return {
+              seasonNumber: nextSeason.number,
+              episodeNumber: firstEp.number,
+              name: firstEp.name,
+            };
+          }
+        }
+      }
+    }
+    return null;
+  }, [title, activeSeason, activeEpisode]);
+
   const [hlsFailed, setHlsFailed] = useState(false);
   useEffect(() => setHlsFailed(false), [id, s, e]);
 
@@ -196,6 +232,8 @@ function WatchPage() {
   const [isLocalPlaying, setIsLocalPlaying] = useState(false);
   const isLocalPlayingRef = useRef(isLocalPlaying);
   const isRoomPausedRef = useRef(false);
+  const [isEnded, setIsEnded] = useState(false);
+  const isEndedRef = useRef(false);
   useEffect(() => {
     isLocalPlayingRef.current = isLocalPlaying;
   }, [isLocalPlaying]);
@@ -209,6 +247,9 @@ function WatchPage() {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const playerContainerRef = useRef<HTMLDivElement>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isUserActive, setIsUserActive] = useState(true);
+  const isUserActiveRef = useRef(true);
+  const userActivityTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const toggleFullscreen = useCallback(async () => {
     try {
@@ -224,13 +265,73 @@ function WatchPage() {
     }
   }, []);
 
+  const handleUserActivity = useCallback(() => {
+    if (!isUserActiveRef.current) {
+      isUserActiveRef.current = true;
+      setIsUserActive(true);
+    }
+    if (userActivityTimerRef.current) {
+      clearTimeout(userActivityTimerRef.current);
+    }
+    if (isFullscreen) {
+      userActivityTimerRef.current = setTimeout(() => {
+        isUserActiveRef.current = false;
+        setIsUserActive(false);
+      }, 2500);
+    }
+  }, [isFullscreen]);
+
   useEffect(() => {
     const handleFullscreenChange = () => {
-      setIsFullscreen(Boolean(document.fullscreenElement));
+      const active = Boolean(document.fullscreenElement);
+      setIsFullscreen(active);
+      if (!active) {
+        isUserActiveRef.current = true;
+        setIsUserActive(true);
+        if (userActivityTimerRef.current) {
+          clearTimeout(userActivityTimerRef.current);
+          userActivityTimerRef.current = null;
+        }
+      }
     };
     document.addEventListener("fullscreenchange", handleFullscreenChange);
     return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
   }, []);
+
+  useEffect(() => {
+    if (!isFullscreen) {
+      isUserActiveRef.current = true;
+      setIsUserActive(true);
+      if (userActivityTimerRef.current) {
+        clearTimeout(userActivityTimerRef.current);
+        userActivityTimerRef.current = null;
+      }
+      return;
+    }
+
+    // Entering fullscreen: show controls initially and start inactivity countdown
+    handleUserActivity();
+
+    const onGlobalActivity = () => {
+      handleUserActivity();
+    };
+
+    window.addEventListener("mousemove", onGlobalActivity, { passive: true });
+    window.addEventListener("pointermove", onGlobalActivity, { passive: true });
+    window.addEventListener("keydown", onGlobalActivity, { passive: true });
+    window.addEventListener("touchstart", onGlobalActivity, { passive: true });
+
+    return () => {
+      window.removeEventListener("mousemove", onGlobalActivity);
+      window.removeEventListener("pointermove", onGlobalActivity);
+      window.removeEventListener("keydown", onGlobalActivity);
+      window.removeEventListener("touchstart", onGlobalActivity);
+      if (userActivityTimerRef.current) {
+        clearTimeout(userActivityTimerRef.current);
+        userActivityTimerRef.current = null;
+      }
+    };
+  }, [isFullscreen, handleUserActivity]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -329,10 +430,13 @@ function WatchPage() {
   const onRemotePlay = useCallback(
     (time: number) => {
       isRoomPausedRef.current = false;
+      setIsEnded(false);
+      isEndedRef.current = false;
       if (playlistUrl && !hlsFailed) {
         setIsLocalPlaying(true);
         isLocalPlayingRef.current = true;
         latestSecondsRef.current = time;
+        remoteActionRef.current = { type: "play", ts: Date.now() };
         hlsPlayerRef.current?.seek(time);
         hlsPlayerRef.current?.play();
       } else {
@@ -375,6 +479,8 @@ function WatchPage() {
       if (!Number.isFinite(time) || time < 0) return;
       const cur = latestSecondsRef.current ?? 0;
       latestSecondsRef.current = time;
+      setIsEnded(false);
+      isEndedRef.current = false;
       if (playlistUrl && !hlsFailed) {
         hlsPlayerRef.current?.seek(time);
       } else {
@@ -402,6 +508,8 @@ function WatchPage() {
 
       if (isDifferentSlug || isDifferentEpisode) {
         latestSecondsRef.current = 0;
+        setIsEnded(false);
+        isEndedRef.current = false;
         const code = (roomCode || partyCode || searchPartyCode || "").trim().toUpperCase();
         if (code) {
           try {
@@ -417,9 +525,17 @@ function WatchPage() {
             party: code || undefined,
           },
         });
+        return;
+      }
+
+      if (media.lang && media.lang !== selectedLang) {
+        partyLangRef.current = media.lang;
+        setSelectedLang(media.lang);
+        const cur = latestSecondsRef.current ?? 0;
+        reloadVixsrc(cur > 0 ? cur : undefined, isLocalPlayingRef.current, media.lang);
       }
     },
-    [slug, activeSeason, activeEpisode, navigate, partyCode, searchPartyCode],
+    [slug, activeSeason, activeEpisode, navigate, partyCode, searchPartyCode, selectedLang, reloadVixsrc],
   );
 
   const getCurrentTime = useCallback(() => {
@@ -479,12 +595,22 @@ function WatchPage() {
     if (activeMediaKeyRef.current !== currentMediaKey) {
       activeMediaKeyRef.current = currentMediaKey;
       latestSecondsRef.current = 0;
+      setIsEnded(false);
+      isEndedRef.current = false;
     }
   }, [currentMediaKey]);
 
-  // Guest auto-synchronizes to host's movie/episode/language whenever room is loaded or changes
+  // Guest auto-synchronizes to room's movie/episode/language once upon initially joining the room
+  const initialRoomSyncedRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!party.room || party.isHost) return;
+    if (!party.room) {
+      initialRoomSyncedRef.current = null;
+      return;
+    }
+    if (party.isHost) return;
+    if (initialRoomSyncedRef.current === party.room.code) return;
+    initialRoomSyncedRef.current = party.room.code;
+
     const media = party.room.media;
     if (!media || !media.slug) return;
 
@@ -499,7 +625,9 @@ function WatchPage() {
 
     if (isDifferentSlug || isDifferentEpisode) {
       latestSecondsRef.current = 0;
-      console.info("Syncing guest to host media:", media.slug, targetSeason, targetEpisode);
+      setIsEnded(false);
+      isEndedRef.current = false;
+      console.info("Syncing guest to room media:", media.slug, targetSeason, targetEpisode);
       const code = (party.room.code || partyCode || searchPartyCode || "").trim().toUpperCase();
       if (code) {
         try {
@@ -527,13 +655,26 @@ function WatchPage() {
     }
   }, [party.room, party.isHost, slug, activeSeason?.number, activeEpisode?.number, navigate, partyCode, searchPartyCode, selectedLang, isLocalPlaying, reloadVixsrc]);
 
-  // Host broadcasts media changes when switching episodes or language
+  // Broadcast media changes when switching episodes or language (host or guest)
   useEffect(() => {
-    if (!party.isHost || !party.room || !title) return;
+    if (!party.room || !title) return;
     const mediaKey = `${slug}:${season}:${episode}:${selectedLang}`;
     if (lastBroadcastMediaRef.current === mediaKey) return;
 
     const prevMedia = party.room.media;
+    const isSameAsRoomMedia =
+      prevMedia &&
+      prevMedia.slug === slug &&
+      (title.type !== "tv" ||
+        ((prevMedia.season ?? 1) === (activeSeason?.number ?? 1) &&
+         (prevMedia.episode ?? 1) === (activeEpisode?.number ?? 1))) &&
+      (!prevMedia.lang || prevMedia.lang === selectedLang);
+
+    if (isSameAsRoomMedia) {
+      lastBroadcastMediaRef.current = mediaKey;
+      return;
+    }
+
     const isDifferentMedia =
       !prevMedia ||
       prevMedia.slug !== slug ||
@@ -547,6 +688,8 @@ function WatchPage() {
     const timeToSend = isDifferentMedia ? 0 : (latestSecondsRef.current ?? 0);
     if (isDifferentMedia) {
       latestSecondsRef.current = 0;
+      setIsEnded(false);
+      isEndedRef.current = false;
     }
 
     party.sendChangeMedia(
@@ -561,7 +704,7 @@ function WatchPage() {
       },
       timeToSend,
     );
-  }, [party.isHost, party.room, party.sendChangeMedia, slug, season, episode, selectedLang, title, activeSeason, activeEpisode]);
+  }, [party.room, party.sendChangeMedia, slug, season, episode, selectedLang, title, activeSeason, activeEpisode]);
 
   const handleLanguageChange = useCallback(
     (newLang: string) => {
@@ -569,7 +712,7 @@ function WatchPage() {
       partyLangRef.current = newLang;
 
       const curTime = latestSecondsRef.current ?? party.room?.state?.time ?? 0;
-      if (party.isHost && party.room && title) {
+      if (party.room && title) {
         party.sendChangeMedia(
           {
             slug,
@@ -586,7 +729,7 @@ function WatchPage() {
 
       reloadVixsrc(curTime > 0 ? curTime : undefined, isLocalPlaying, newLang);
     },
-    [party.isHost, party.room, party.sendChangeMedia, title, slug, activeSeason?.number, activeEpisode?.number, reloadVixsrc, isLocalPlaying],
+    [party.room, party.sendChangeMedia, title, slug, activeSeason?.number, activeEpisode?.number, reloadVixsrc, isLocalPlaying],
   );
 
   // Automatically update video audio language when the site's locale is switched
@@ -948,10 +1091,23 @@ function WatchPage() {
         } else {
           const lower = trimmed.toLowerCase();
           if (lower === "pause") {
+            const curSec = latestSecondsRef.current ?? 0;
+            const isNearEnd =
+              isEndedRef.current ||
+              (playbackDurationSeconds > 0 && curSec >= playbackDurationSeconds - 3);
+            if (isNearEnd) {
+              setIsEnded(true);
+              isEndedRef.current = true;
+              setIsLocalPlaying(false);
+              isLocalPlayingRef.current = false;
+              clearCompletedMarker();
+              persistMarker(0, true);
+              return;
+            }
+
             isRoomPausedRef.current = true;
             setIsLocalPlaying(false);
             isLocalPlayingRef.current = false;
-            const curSec = latestSecondsRef.current ?? 0;
             persistMarker(curSec, true);
             const isStartupPause =
               pendingIframeStartupRef.current.key === vixsrcIframeKey &&
@@ -973,6 +1129,8 @@ function WatchPage() {
             if (isRoomPausedRef.current || !isLocalPlayingRef.current) {
               return;
             }
+            setIsEnded(false);
+            isEndedRef.current = false;
             const isStartupPlay =
               pendingIframeStartupRef.current.key === vixsrcIframeKey &&
               pendingIframeStartupRef.current.expectedAutoplay === true;
@@ -1003,6 +1161,8 @@ function WatchPage() {
             return;
           }
           if (lower === "seeking" || lower === "seek" || lower === "seeked") {
+            setIsEnded(false);
+            isEndedRef.current = false;
             const curSec = latestSecondsRef.current ?? 0;
             persistMarker(curSec, true);
             const isStartupSeek =
@@ -1022,6 +1182,8 @@ function WatchPage() {
             return;
           }
           if (lower === "ended" || lower === "finish" || lower === "complete") {
+            setIsEnded(true);
+            isEndedRef.current = true;
             setIsLocalPlaying(false);
             isLocalPlayingRef.current = false;
             clearCompletedMarker();
@@ -1130,6 +1292,8 @@ function WatchPage() {
 
       // Handle video completion
       if (eventName === "ended" || eventName === "complete" || eventName === "finish") {
+        setIsEnded(true);
+        isEndedRef.current = true;
         setIsLocalPlaying(false);
         isLocalPlayingRef.current = false;
         clearCompletedMarker();
@@ -1139,15 +1303,14 @@ function WatchPage() {
 
       const durationLimit = totalDuration || playbackDurationSeconds;
       if (seconds !== null && durationLimit > 0 && seconds >= durationLimit - 10) {
-        setIsLocalPlaying(false);
-        isLocalPlayingRef.current = false;
         clearCompletedMarker();
         persistMarker(0, true);
-        return;
       }
 
       // Handle seek events (mouse drag/click on progress bar)
       if (eventName === "seeked" || eventName === "seek") {
+        setIsEnded(false);
+        isEndedRef.current = false;
         const curSec = seconds ?? latestSecondsRef.current;
         if (curSec === null || !Number.isFinite(curSec) || curSec < 0) return;
         latestSecondsRef.current = curSec;
@@ -1173,10 +1336,24 @@ function WatchPage() {
 
       // Handle pause events
       if (eventName === "pause") {
+        const curSec = seconds ?? latestSecondsRef.current ?? 0;
+        const isNearEnd =
+          isEndedRef.current ||
+          (totalDuration !== null && totalDuration > 0 && curSec >= totalDuration - 3);
+
+        if (isNearEnd) {
+          setIsEnded(true);
+          isEndedRef.current = true;
+          setIsLocalPlaying(false);
+          isLocalPlayingRef.current = false;
+          clearCompletedMarker();
+          persistMarker(0, true);
+          return;
+        }
+
         isRoomPausedRef.current = true;
         setIsLocalPlaying(false);
         isLocalPlayingRef.current = false;
-        const curSec = seconds ?? latestSecondsRef.current ?? 0;
         if (Number.isFinite(curSec) && curSec >= 0) {
           latestSecondsRef.current = curSec;
           persistMarker(curSec, true);
@@ -1202,6 +1379,8 @@ function WatchPage() {
 
       // Handle play events
       if (eventName === "play" || eventName === "playing" || eventName === "start") {
+        setIsEnded(false);
+        isEndedRef.current = false;
         if (isRoomPausedRef.current || !isLocalPlayingRef.current) {
           return;
         }
@@ -1450,9 +1629,13 @@ function WatchPage() {
           {adBlockPrompt.shouldShow ? <AdBlockPrompt browser={adBlockPrompt.info.browser} /> : null}
           <div
             ref={playerContainerRef}
+            onMouseMove={handleUserActivity}
+            onPointerMove={handleUserActivity}
+            onMouseDown={handleUserActivity}
+            onTouchStart={handleUserActivity}
             className={`group relative w-full overflow-hidden bg-black transition-all ${
               isFullscreen
-                ? "h-screen rounded-none border-none"
+                ? `h-screen rounded-none border-none ${!isUserActive ? "cursor-none" : ""}`
                 : "aspect-video rounded-xl border border-border"
             }`}
           >
@@ -1467,11 +1650,33 @@ function WatchPage() {
               />
             )}
 
+            {/* In fullscreen, transparent overlay that hides cursor when idle and wakes up on mouse movement */}
+            {isFullscreen && (
+              <div
+                onMouseMove={handleUserActivity}
+                onPointerMove={handleUserActivity}
+                onMouseDown={handleUserActivity}
+                onTouchStart={handleUserActivity}
+                className={`absolute inset-0 z-10 bg-transparent transition-opacity duration-300 ${
+                  !isUserActive
+                    ? "pointer-events-auto cursor-none"
+                    : "pointer-events-none cursor-default"
+                }`}
+                aria-hidden="true"
+              />
+            )}
+
             {/* Quick fullscreen toggle button on player container */}
             <button
               type="button"
               onClick={toggleFullscreen}
-              className="absolute top-3 right-3 z-30 rounded-lg bg-black/60 p-2 text-white/80 opacity-0 backdrop-blur transition-opacity hover:bg-black/90 hover:text-white group-hover:opacity-100 focus:opacity-100"
+              className={`absolute top-3 right-3 z-30 rounded-lg bg-black/60 p-2 text-white/80 backdrop-blur transition-opacity duration-300 hover:bg-black/90 hover:text-white ${
+                isFullscreen
+                  ? isUserActive
+                    ? "opacity-100 pointer-events-auto"
+                    : "opacity-0 pointer-events-none"
+                  : "opacity-0 group-hover:opacity-100 focus:opacity-100 pointer-events-auto"
+              }`}
               title={isFullscreen ? "Esci dallo schermo intero (F)" : "Schermo intero (F)"}
             >
               {isFullscreen ? <Minimize className="size-4" /> : <Maximize className="size-4" />}
@@ -1487,43 +1692,107 @@ function WatchPage() {
                   />
                 ) : null}
                 <div className="relative z-10 flex flex-col items-center gap-3 rounded-xl border border-border/80 bg-card/95 p-6 text-center shadow-2xl max-w-sm mx-4">
-                  <div className="rounded-full bg-primary/10 p-3 text-primary">
-                    <Pause className="size-6 animate-pulse" />
-                  </div>
-                  <div className="space-y-1">
-                    <h3 className="text-base font-semibold text-foreground">Riproduzione in pausa</h3>
-                    <p className="text-xs text-muted-foreground">
-                      La stanza è in pausa. Clicca play per riprendere la visione insieme.
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2 mt-1">
-                    <Button
-                      size="sm"
-                      className="gap-2 font-medium"
-                      onClick={() => {
-                        const cur = latestSecondsRef.current ?? party.room?.state?.time ?? 0;
-                        isRoomPausedRef.current = false;
-                        setIsLocalPlaying(true);
-                        isLocalPlayingRef.current = true;
-                        party.sendPlay(cur);
-                        if (!playlistUrl || hlsFailed) {
-                          reloadVixsrc(cur, true);
-                        }
-                      }}
-                    >
-                      <Play className="size-4 fill-current" />
-                      Riprendi insieme
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="gap-1.5"
-                      onClick={toggleFullscreen}
-                      title={isFullscreen ? "Esci dallo schermo intero" : "Schermo intero"}
-                    >
-                      {isFullscreen ? <Minimize className="size-4" /> : <Maximize className="size-4" />}
-                    </Button>
-                  </div>
+                  {isEnded ? (
+                    <>
+                      <div className="rounded-full bg-emerald-500/10 p-3 text-emerald-400">
+                        <CheckCircle2 className="size-6" />
+                      </div>
+                      <div className="space-y-1">
+                        <h3 className="text-base font-semibold text-foreground">
+                          {activeEpisode ? "Episodio terminato" : "Visione completata"}
+                        </h3>
+                        <p className="text-xs text-muted-foreground">
+                          {nextEpisode
+                            ? `Passa al prossimo episodio (E${nextEpisode.episodeNumber}) per continuare a guardare insieme.`
+                            : "Visione completata. Puoi ricominciare dall'inizio o scegliere un altro episodio."}
+                        </p>
+                      </div>
+                      <div className="flex flex-wrap items-center justify-center gap-2 mt-1">
+                        {nextEpisode && (
+                          <Button
+                            size="sm"
+                            className="gap-2 font-medium"
+                            onClick={() => {
+                              setIsEnded(false);
+                              isEndedRef.current = false;
+                              const code = (party.room?.code || partyCode || searchPartyCode || "").trim().toUpperCase();
+                              void navigate({
+                                to: "/watch/$id",
+                                params: { id: slug },
+                                search: {
+                                  s: nextEpisode.seasonNumber,
+                                  e: nextEpisode.episodeNumber,
+                                  party: code || undefined,
+                                },
+                              });
+                            }}
+                          >
+                            <Play className="size-4 fill-current" />
+                            Prossimo episodio (E{nextEpisode.episodeNumber})
+                          </Button>
+                        )}
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="gap-1.5"
+                          onClick={() => {
+                            setIsEnded(false);
+                            isEndedRef.current = false;
+                            isRoomPausedRef.current = false;
+                            setIsLocalPlaying(true);
+                            isLocalPlayingRef.current = true;
+                            latestSecondsRef.current = 0;
+                            party.sendSeek(0);
+                            party.sendPlay(0);
+                            reloadVixsrc(0, true);
+                          }}
+                        >
+                          <RotateCcw className="size-3.5" />
+                          Ricomincia dall'inizio
+                        </Button>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="rounded-full bg-primary/10 p-3 text-primary">
+                        <Pause className="size-6 animate-pulse" />
+                      </div>
+                      <div className="space-y-1">
+                        <h3 className="text-base font-semibold text-foreground">Riproduzione in pausa</h3>
+                        <p className="text-xs text-muted-foreground">
+                          La stanza è in pausa. Clicca play per riprendere la visione insieme.
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2 mt-1">
+                        <Button
+                          size="sm"
+                          className="gap-2 font-medium"
+                          onClick={() => {
+                            const cur = latestSecondsRef.current ?? party.room?.state?.time ?? 0;
+                            isRoomPausedRef.current = false;
+                            setIsLocalPlaying(true);
+                            isLocalPlayingRef.current = true;
+                            party.sendPlay(cur);
+                            if (!playlistUrl || hlsFailed) {
+                              reloadVixsrc(cur, true);
+                            }
+                          }}
+                        >
+                          <Play className="size-4 fill-current" />
+                          Riprendi insieme
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="gap-1.5"
+                          onClick={toggleFullscreen}
+                          title={isFullscreen ? "Esci dallo schermo intero" : "Schermo intero"}
+                        >
+                          {isFullscreen ? <Minimize className="size-4" /> : <Maximize className="size-4" />}
+                        </Button>
+                      </div>
+                    </>
+                  )}
                 </div>
               </div>
             )}

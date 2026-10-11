@@ -278,9 +278,23 @@ export function useWatchParty({
 
   const sendChangeMedia = useCallback(
     (media: PartyMedia, time = 0) => {
+      setRoom((prev) =>
+        prev
+          ? {
+              ...prev,
+              media,
+              state: {
+                ...prev.state,
+                isPlaying: false,
+                time,
+                lastUpdated: Date.now(),
+              },
+            }
+          : null,
+      );
       void sendEvent({ type: "CHANGE_MEDIA", media, time });
     },
-    [sendEvent],
+    [sendEvent, setRoom],
   );
 
   const sendChat = useCallback(
