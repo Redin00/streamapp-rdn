@@ -98,6 +98,7 @@ def connect() -> Iterator[sqlite3.Connection]:
     """
     conn = sqlite3.connect(DB_PATH, timeout=5.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA trusted_schema=OFF")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
     try:
@@ -123,6 +124,11 @@ def init_db() -> None:
             conn.execute("ALTER TABLE watch_history ADD COLUMN marker INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass  # column already present
+    try:
+        if DB_PATH.exists():
+            os.chmod(DB_PATH, 0o600)
+    except OSError:
+        pass
     log.info("database ready at %s", DB_PATH)
 
 
@@ -158,6 +164,8 @@ def get_db_cache(key: str) -> Optional[tuple[float, Any]]:
 
 def set_db_cache(key: str, data: Any) -> None:
     """Store cached catalogue payload into SQLite for persistent survival across restarts."""
+    if len(key) > 300:
+        return
     payload_str = json.dumps(data, ensure_ascii=False)
     with connect() as conn:
         conn.execute(
@@ -167,6 +175,17 @@ def set_db_cache(key: str, data: Any) -> None:
             """,
             (key, payload_str, now()),
         )
+        # Prevent unbounded SQLite growth from cache-flooding attacks
+        count = conn.execute("SELECT COUNT(*) AS n FROM catalogue_cache").fetchone()["n"]
+        if count > 1000:
+            conn.execute(
+                """
+                DELETE FROM catalogue_cache
+                WHERE key IN (
+                    SELECT key FROM catalogue_cache ORDER BY updated_at ASC LIMIT 200
+                )
+                """
+            )
 
 
 def clear_db_cache() -> None:
@@ -182,6 +201,17 @@ def _number(value: Any) -> Optional[float]:
     return float(value)
 
 
+def _safe_media_url(raw_val: Any, limit: int = 600) -> str:
+    if raw_val is None:
+        return ""
+    s = str(raw_val).strip()[:limit]
+    if not s:
+        return ""
+    if s.startswith("https://") or s.startswith("http://") or s.startswith("/"):
+        return s.replace("<", "").replace(">", "").replace('"', "").replace("'", "")
+    return ""
+
+
 def clean_snapshot(raw: Any) -> str:
     """Normalise a client-sent title summary into a bounded JSON blob.
 
@@ -193,10 +223,16 @@ def clean_snapshot(raw: Any) -> str:
 
     def text(key: str, limit: int) -> str:
         value = src.get(key)
-        return "" if value is None else str(value)[:limit]
+        if value is None:
+            return ""
+        return str(value).replace("<", "").replace(">", "").replace("\x00", "")[:limit]
 
     raw_genres = src.get("genres")
-    genres = [str(g)[:60] for g in raw_genres[:8] if g] if isinstance(raw_genres, list) else []
+    genres = (
+        [str(g).replace("<", "").replace(">", "")[:60] for g in raw_genres[:8] if g]
+        if isinstance(raw_genres, list)
+        else []
+    )
     seasons_count = _number(src.get("seasonsCount"))
 
     snapshot: Dict[str, Any] = {
@@ -206,8 +242,8 @@ def clean_snapshot(raw: Any) -> str:
         "type": src.get("type") if src.get("type") in ("movie", "tv") else "tv",
         "year": int(_number(src.get("year")) or 0),
         "score": round(_number(src.get("score")) or 0.0, 1),
-        "posterUrl": text("posterUrl", 600),
-        "backdropUrl": text("backdropUrl", 600),
+        "posterUrl": _safe_media_url(src.get("posterUrl"), 600),
+        "backdropUrl": _safe_media_url(src.get("backdropUrl"), 600),
         "genres": genres,
     }
     if seasons_count is not None:

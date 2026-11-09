@@ -57,7 +57,7 @@ import requests
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Response, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
 from auth import bootstrap_admin, require_admin
@@ -71,6 +71,13 @@ from db import (
     set_setting,
 )
 from library import router as library_router
+from security import (
+    SecurityHeadersMiddleware,
+    is_safe_public_hostname,
+    limit_requests,
+    resolve_safe_upload_path,
+    validate_safe_external_url,
+)
 from watch_party import router as party_router, handle_party_websocket
 
 # --------------------------------------------------------------------------- #
@@ -119,7 +126,10 @@ _REDIRECT_CHECK_COOLDOWN: float = 60.0  # seconds
 
 # Where uploaded profile pictures are stored
 _PROFILE_PICTURES_DIR = Path(
-    os.environ.get("SC_PROFILE_PICTURES_DIR", str(Path(__file__).parent / "uploads"))
+    os.environ.get(
+        "SC_PROFILE_PICTURES_DIR",
+        os.environ.get("SC_UPLOAD_DIR", str(Path(__file__).parent / "uploads")),
+    )
 )
 _PROFILE_PICTURES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -268,11 +278,8 @@ BLOCKED_HOST_PATTERNS = (
 
 def _is_valid_vixsrc_redirect(target_host: str, page_content: str = "") -> bool:
     host = target_host.strip().lower()
-    if not host or "/" in host or " " in host or "." not in host:
+    if not is_safe_public_hostname(host, extra_blocked=BLOCKED_HOST_PATTERNS):
         return False
-    for blocked in BLOCKED_HOST_PATTERNS:
-        if blocked in host:
-            return False
     if "vix" in host:
         return True
     content_lower = page_content.lower()
@@ -398,13 +405,23 @@ async def lifespan(app: FastAPI):
             pass
 
 
-app = FastAPI(title="StreamApp - Rdn API", version="2.0.0", lifespan=lifespan)
+_DOCS_ENABLED = os.environ.get("SC_ENABLE_DOCS", "0").strip() == "1"
+
+app = FastAPI(
+    title="StreamApp - Rdn API",
+    version="2.0.0",
+    lifespan=lifespan,
+    docs_url="/docs" if _DOCS_ENABLED else None,
+    redoc_url="/redoc" if _DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if _DOCS_ENABLED else None,
+)
+app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
+    expose_headers=["Retry-After"],
 )
 app.include_router(auth_router)
 app.include_router(library_router)
@@ -432,11 +449,23 @@ async def party_ws_route(
     )
 
 
-app.mount(
-    "/profile-pictures",
-    StaticFiles(directory=str(_PROFILE_PICTURES_DIR), follow_symlink=True),
-    name="profile_pictures",
-)
+@app.get("/profile-pictures/{filename}")
+def get_profile_picture(filename: str):
+    """Serve uploaded profile pictures safely without following symlinks or path traversal."""
+    safe_path = resolve_safe_upload_path(_PROFILE_PICTURES_DIR, filename)
+    if not safe_path.is_file():
+        raise HTTPException(status_code=404, detail="Profile picture not found")
+    ext = safe_path.suffix.lower()
+    media_type = "image/png" if ext == ".png" else "image/jpeg"
+    return FileResponse(
+        safe_path,
+        media_type=media_type,
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": "inline",
+            "Content-Security-Policy": "default-src 'none'; img-src 'self'; style-src 'none'; script-src 'none'; sandbox",
+        },
+    )
 
 
 def cached(key: str, producer, ttl: Optional[int] = None):
@@ -742,6 +771,7 @@ def resolve_playlist(
         raise RuntimeError("playback host returned no embed source")
 
     embed_url = src if src.startswith("http") else base + src
+    embed_url = validate_safe_external_url(embed_url, extra_blocked=BLOCKED_HOST_PATTERNS)
     try:
         page_res = vixsrc_session.get(embed_url, headers={"referer": referer}, timeout=20)
         page = page_res.text
@@ -761,6 +791,7 @@ def resolve_playlist(
             base = f"https://{VIXSRC_DOMAIN}"
             referer = f"{base}/{kind}/{tmdb_id}{suffix}"
             embed_url = src if src.startswith("http") else base + src
+            embed_url = validate_safe_external_url(embed_url, extra_blocked=BLOCKED_HOST_PATTERNS)
             page_res = vixsrc_session.get(embed_url, headers={"referer": referer}, timeout=20)
             page = page_res.text
         else:
@@ -814,9 +845,11 @@ class DomainSettings(BaseModel):
     @field_validator("vixsrcDomain")
     @classmethod
     def validate_domain(cls, value: str) -> str:
-        value = value.strip().removeprefix("https://").removeprefix("http://").rstrip("/")
+        value = value.strip().removeprefix("https://").removeprefix("http://").rstrip("/").lower()
         if not value or "/" in value or " " in value:
             raise ValueError("domain must be a hostname without a scheme or path")
+        if not is_safe_public_hostname(value, extra_blocked=BLOCKED_HOST_PATTERNS):
+            raise ValueError("domain must be a valid public hostname (private IPs and internal hosts are forbidden)")
         return value
 
 
@@ -850,13 +883,13 @@ def player():
     }
 
 
-@app.get("/stream")
+@app.get("/stream", dependencies=[Depends(limit_requests("stream", 30, 60.0))])
 def stream(
-    tmdb: int = Query(..., gt=0),
+    tmdb: int = Query(..., gt=0, le=100_000_000),
     type: str = Query("movie", pattern="^(movie|tv)$"),
-    s: Optional[int] = Query(None, gt=0),
-    e: Optional[int] = Query(None, gt=0),
-    lang: str = Query("it"),
+    s: Optional[int] = Query(None, gt=0, le=1000),
+    e: Optional[int] = Query(None, gt=0, le=10000),
+    lang: str = Query("it", min_length=2, max_length=10, pattern=r"^[a-zA-Z-]+$"),
 ):
     """Direct HLS master playlist resolved from Vixsrc."""
     if not VIXSRC_DOMAIN:
@@ -866,21 +899,21 @@ def stream(
 
     try:
         resolved = cached(
-            f"stream:{type}:{tmdb}:{s}:{e}:{lang}",
-            lambda: resolve_playlist(tmdb, type, s, e, lang=lang),
+            f"stream:{type}:{tmdb}:{s}:{e}:{lang.lower()}",
+            lambda: resolve_playlist(tmdb, type, s, e, lang=lang.lower()),
         )
     except HTTPException:
         raise
-    except Exception as exc:
+    except Exception:
         log.exception("stream %s %s failed", type, tmdb)
-        raise HTTPException(status_code=502, detail=f"could not resolve stream: {exc}")
+        raise HTTPException(status_code=502, detail="could not resolve stream from upstream provider")
 
     if resolved is None:
         raise HTTPException(status_code=404, detail="title not available on the playback host")
     return {"provider": "vixsrc", **resolved}
 
 
-@app.get("/search")
+@app.get("/search", dependencies=[Depends(limit_requests("search", 40, 60.0))])
 def search(q: str = Query(..., max_length=120)):
     """Search titles via TMDB."""
     try:
@@ -894,9 +927,9 @@ def search(q: str = Query(..., max_length=120)):
         return items
     except HTTPException:
         raise
-    except Exception as exc:
+    except Exception:
         log.exception("search q=%r failed", q)
-        raise HTTPException(status_code=502, detail=f"TMDB search failed: {exc}")
+        raise HTTPException(status_code=502, detail="TMDB search failed")
 
 
 @app.get("/trending")
@@ -928,9 +961,9 @@ def trending():
         return cached("trending", get_trending, ttl=1800)
     except HTTPException:
         raise
-    except Exception as exc:
+    except Exception:
         log.exception("trending failed")
-        raise HTTPException(status_code=502, detail=f"TMDB trending failed: {exc}")
+        raise HTTPException(status_code=502, detail="TMDB trending failed")
 
 
 @app.get("/latest")
@@ -966,14 +999,17 @@ def latest():
         return cached("latest", get_latest, ttl=1800)
     except HTTPException:
         raise
-    except Exception as exc:
+    except Exception:
         log.exception("latest failed")
-        raise HTTPException(status_code=502, detail=f"TMDB latest failed: {exc}")
+        raise HTTPException(status_code=502, detail="TMDB latest failed")
 
 
 @app.get("/title/{content_id}")
 def title(content_id: str):
     """Fetch title details, cast, trailers, and seasons/episodes."""
+    if len(content_id) > 200:
+        raise HTTPException(status_code=400, detail="Invalid title id")
+
     def load():
         match = re.match(r"^(\d+)(?:-(movie|tv))?", content_id.strip())
         if not match:
@@ -1048,9 +1084,9 @@ def title(content_id: str):
         return cached(f"title:{content_id}", load, ttl=86400)
     except HTTPException:
         raise
-    except Exception as exc:
+    except Exception:
         log.exception("title %r failed", content_id)
-        raise HTTPException(status_code=404, detail=f"Title not found: {exc}")
+        raise HTTPException(status_code=404, detail="Title not found")
 
 
 @app.get("/stats")
@@ -1079,6 +1115,6 @@ def stats():
 
     try:
         return cached("stats", build, ttl=3600)
-    except Exception as exc:
+    except Exception:
         log.exception("stats failed")
-        raise HTTPException(status_code=502, detail=f"stats failed: {exc}")
+        raise HTTPException(status_code=502, detail="stats failed")

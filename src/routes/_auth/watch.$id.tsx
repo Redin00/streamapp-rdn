@@ -1063,8 +1063,11 @@ function WatchPage() {
     if (!markerLoaded) return;
 
     const handlePlayerMessage = (event: MessageEvent) => {
-      // Ignore self-dispatched messages
+      // Ignore self-dispatched messages and messages not coming from our active player iframe
       if (event.source === window) return;
+      if (iframeRef.current?.contentWindow && event.source !== iframeRef.current.contentWindow) {
+        return;
+      }
 
       let data = event.data;
       if (!data) return;

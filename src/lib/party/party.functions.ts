@@ -6,33 +6,47 @@ import type { PartyEventResponse, PartyMedia, PartyPollResponse, WatchPartyRoom 
 import { SESSION_COOKIE, messageFor, serviceFetch } from "../service";
 
 const mediaSchema = z.object({
-  slug: z.string().min(1),
+  slug: z.string().min(1).max(200),
   tmdbId: z.number().nullable().optional(),
   type: z.enum(["movie", "tv"]),
   season: z.number().nullable().optional(),
   episode: z.number().nullable().optional(),
-  titleName: z.string().optional(),
+  titleName: z.string().max(300).optional(),
+  lang: z.string().max(12).optional(),
 });
 
 const createPartySchema = z.object({
   media: mediaSchema,
   initialTime: z.number().default(0),
-  guestId: z.string().optional(),
-  guestName: z.string().optional(),
-  guestColor: z.string().optional(),
-  guestAvatar: z.string().nullable().optional(),
+  guestId: z.string().max(64).optional(),
+  guestName: z.string().max(40).optional(),
+  guestColor: z.string().max(16).optional(),
+  guestAvatar: z.string().max(500).nullable().optional(),
 });
 
+async function fetchShortLivedWsTicket(): Promise<string | null> {
+  const sessionToken = getCookie(SESSION_COOKIE);
+  if (!sessionToken) return null;
+  try {
+    const res = await serviceFetch<{ ticket: string | null }>("/party/ws-ticket", {
+      method: "GET",
+    });
+    return res.ticket ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export const getPartyConnectionInfo = createServerFn({ method: "GET" }).handler(async () => {
-  const token = getCookie(SESSION_COOKIE) || null;
+  // Never expose the raw httpOnly session token to browser JS; issue a short-lived scoped WS ticket.
+  const token = await fetchShortLivedWsTicket();
   const scBaseUrl = process.env["SC_BASE_URL"] || null;
   const scPort = process.env["SC_PORT"] || "8000";
   return { token, scBaseUrl, scPort };
 });
 
 export const getPartyToken = createServerFn({ method: "GET" }).handler(async () => {
-  const token = getCookie(SESSION_COOKIE);
-  return token || null;
+  return await fetchShortLivedWsTicket();
 });
 
 export const createPartyRoom = createServerFn({ method: "POST" })

@@ -12,8 +12,23 @@ const domain = z
   .trim()
   .min(1, "Domain is required")
   .max(253)
-  .transform((value) => value.replace(/^https?:\/\//, "").replace(/\/$/, ""))
-  .refine((value) => !/[\s/]/.test(value), "Enter a hostname without a path");
+  .transform((value) => value.replace(/^https?:\/\//i, "").replace(/\/$/, "").toLowerCase())
+  .refine((value) => !/[\s/:@?#[\]]/.test(value), "Enter a valid hostname without a port or path")
+  .refine(
+    (value) =>
+      /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(
+        value,
+      ) && !/^\d+(?:\.\d+){3}$/.test(value),
+    "Enter a valid public domain name (IP addresses and local hosts are not allowed)",
+  )
+  .refine(
+    (value) =>
+      !value.endsWith(".local") &&
+      !value.endsWith(".internal") &&
+      !value.endsWith(".localhost") &&
+      value !== "localhost",
+    "Local or internal domains are not allowed",
+  );
 
 export const getDomainSettings = createServerFn({ method: "GET" }).handler(
   async (): Promise<DomainSettings> => serviceFetch<DomainSettings>("/settings/domains"),

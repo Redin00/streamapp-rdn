@@ -62,6 +62,10 @@ function loginFailure(error: unknown): LoginResult {
   };
 }
 
+function isServiceReachableError(error: unknown): boolean {
+  return error instanceof ServiceError && error.status > 0;
+}
+
 /** The profile picker. Falls back to built-in sample profiles when the Python service is unreachable. */
 export const getProfiles = createServerFn({ method: "GET" }).handler(
   async (): Promise<Profile[] | null> => {
@@ -88,7 +92,10 @@ export const login = createServerFn({ method: "POST" })
       // httpOnly, so no script running in the page can lift the session token.
       setCookie(SESSION_COOKIE, result.token, { ...COOKIE, maxAge: SESSION_MAX_AGE });
       return { ok: true, viewer: result.account };
-    } catch {
+    } catch (error) {
+      if (isServiceReachableError(error)) {
+        return loginFailure(error);
+      }
       // Never authenticate locally when the account service is unavailable.
       return loginFailure(new ServiceError(503, "Authentication service unavailable"));
     }
@@ -160,7 +167,10 @@ export const createAccount = createServerFn({ method: "POST" })
         body: JSON.stringify({ ...data, color }),
       });
       return { ok: true, data: account };
-    } catch {
+    } catch (error) {
+      if (isServiceReachableError(error) || process.env["NODE_ENV"] === "production") {
+        return { ok: false, message: messageFor(error) };
+      }
       const base: Omit<AccountRow, "profilePicture"> = {
         id: nextId(),
         name: data.name,
@@ -206,7 +216,10 @@ export const updateAccount = createServerFn({ method: "POST" })
         body: JSON.stringify(patch),
       });
       return { ok: true, data: account };
-    } catch {
+    } catch (error) {
+      if (isServiceReachableError(error) || process.env["NODE_ENV"] === "production") {
+        return { ok: false, message: messageFor(error) };
+      }
       const idx = mockAccounts.findIndex((a) => a.id === id);
       if (idx === -1) return { ok: false, message: "Account not found" };
       const acc = mockAccounts[idx]!;
@@ -301,6 +314,9 @@ export const changeProfilePicture = createServerFn({ method: "POST" })
       }
       return { ok: false, message: "No picture provided" };
     } catch (error) {
+      if (isServiceReachableError(error) || process.env["NODE_ENV"] === "production") {
+        return { ok: false, message: messageFor(error) };
+      }
       // Mock fallback: keep a local in-memory copy of the current viewer's picture.
       const mockViewer = mockProfiles[0];
       if (!mockViewer) return { ok: false, message: messageFor(error) };
@@ -371,6 +387,9 @@ export const setAccountPicture = createServerFn({ method: "POST" })
       }
       return { ok: false, message: "No picture provided" };
     } catch (error) {
+      if (isServiceReachableError(error) || process.env["NODE_ENV"] === "production") {
+        return { ok: false, message: messageFor(error) };
+      }
       // Mock fallback — simulate by updating mockAccounts in memory.
       const idx = mockAccounts.findIndex((a) => a.id === accountId);
       if (idx === -1) return { ok: false, message: "Account not found" };
@@ -393,7 +412,10 @@ export const resetPassword = createServerFn({ method: "POST" })
         body: JSON.stringify({ password: data.password }),
       });
       return { ok: true, data: null };
-    } catch {
+    } catch (error) {
+      if (isServiceReachableError(error) || process.env["NODE_ENV"] === "production") {
+        return { ok: false, message: messageFor(error) };
+      }
       const idx = mockAccounts.findIndex((a) => a.id === data.id);
       if (idx === -1) return { ok: false, message: "Account not found" };
       mockAccounts[idx]!.lockedUntil = null;
@@ -407,7 +429,10 @@ export const deleteAccount = createServerFn({ method: "POST" })
     try {
       await serviceFetch<void>(`/accounts/${data.id}`, { method: "DELETE" });
       return { ok: true, data: null };
-    } catch {
+    } catch (error) {
+      if (isServiceReachableError(error) || process.env["NODE_ENV"] === "production") {
+        return { ok: false, message: messageFor(error) };
+      }
       const idx = mockAccounts.findIndex((a) => a.id === data.id);
       if (idx === -1) return { ok: false, message: "Account not found" };
       mockAccounts.splice(idx, 1);
@@ -423,7 +448,10 @@ export const clearAllHistory = createServerFn({ method: "POST" }).handler(
     try {
       await serviceFetch<void>("/history/clear-all", { method: "DELETE" });
       return { ok: true, data: null };
-    } catch {
+    } catch (error) {
+      if (isServiceReachableError(error) || process.env["NODE_ENV"] === "production") {
+        return { ok: false, message: messageFor(error) };
+      }
       mockHistory.length = 0;
       return { ok: true, data: null };
     }
@@ -436,7 +464,10 @@ export const clearAllLibrary = createServerFn({ method: "POST" }).handler(
     try {
       await serviceFetch<void>("/library/clear-all", { method: "DELETE" });
       return { ok: true, data: null };
-    } catch {
+    } catch (error) {
+      if (isServiceReachableError(error) || process.env["NODE_ENV"] === "production") {
+        return { ok: false, message: messageFor(error) };
+      }
       mockLibrary.length = 0;
       return { ok: true, data: null };
     }

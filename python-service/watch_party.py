@@ -16,14 +16,28 @@ from typing import Any, Dict, List, Optional, Set
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.security import HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from auth import bearer, current_account, current_session, Session, token_hash
 from db import connect, now
+from security import (
+    create_ws_ticket,
+    limit_requests,
+    sanitize_avatar_url,
+    sanitize_display_name,
+    sanitize_guest_color,
+    validate_room_code,
+    validate_slug,
+    verify_ws_ticket,
+)
 
 log = logging.getLogger("streaming-dashboard")
 
 router = APIRouter(prefix="/party", tags=["watch-party"])
+
+MAX_ACTIVE_ROOMS = 500
+MAX_ROOM_MEMBERS = 50
+MAX_WS_MESSAGE_CHARS = 8192
 
 
 # --------------------------------------------------------------------------- #
@@ -31,10 +45,23 @@ router = APIRouter(prefix="/party", tags=["watch-party"])
 # --------------------------------------------------------------------------- #
 
 def get_account_from_token(token: str) -> Optional[Dict[str, Any]]:
-    """Resolve an account dict from a raw bearer/cookie session token string."""
+    """Resolve an account dict from a short-lived ws ticket or raw session token string."""
     if not token:
         return None
     try:
+        if token.startswith("ws."):
+            ws_account_id = verify_ws_ticket(token)
+            if ws_account_id is None:
+                return None
+            with connect() as conn:
+                row = conn.execute(
+                    "SELECT id, name, role, color, profile_picture FROM accounts WHERE id = ?",
+                    (ws_account_id,),
+                ).fetchone()
+                if row:
+                    return dict(row)
+            return None
+
         with connect() as conn:
             row = conn.execute(
                 """
@@ -87,19 +114,23 @@ def resolve_party_participant(
     guest_color: Optional[str] = None,
     guest_avatar: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Return the authenticated account or build a stable guest participant."""
+    """Return the authenticated account or build a stable, sanitized guest participant."""
     if account:
         return account
 
-    gid = (guest_id or "").strip()
+    gid = (guest_id or "").strip()[:64]
     if not gid:
         gid = f"guest-{secrets.token_hex(4)}"
 
     # Deterministic positive integer ID for this guest
     numeric_id = (abs(hash(gid)) % 900000) + 100000
-    display_name = (guest_name or "").strip() or f"Ospite {str(numeric_id)[-3:]}"
-    color = (guest_color or "").strip() or "#f59e0b"
-    avatar = (guest_avatar or "").strip() or None
+    raw_name = (guest_name or "").strip()
+    try:
+        display_name = sanitize_display_name(raw_name, max_length=32) if raw_name else f"Ospite {str(numeric_id)[-3:]}"
+    except ValueError:
+        display_name = f"Ospite {str(numeric_id)[-3:]}"
+    color = sanitize_guest_color(guest_color, default="#f59e0b")
+    avatar = sanitize_avatar_url(guest_avatar)
 
     return {
         "id": numeric_id,
@@ -126,13 +157,46 @@ def generate_room_code(length: int = 6) -> str:
 # --------------------------------------------------------------------------- #
 
 class MediaPayload(BaseModel):
-    slug: str
-    tmdbId: Optional[int] = None
-    type: str  # "movie" or "tv"
-    season: Optional[int] = None
-    episode: Optional[int] = None
-    titleName: Optional[str] = None
-    lang: Optional[str] = None
+    slug: str = Field(min_length=1, max_length=200)
+    tmdbId: Optional[int] = Field(default=None, ge=0, le=100_000_000)
+    type: str = Field(min_length=2, max_length=16)  # "movie" or "tv"
+    season: Optional[int] = Field(default=None, ge=0, le=1000)
+    episode: Optional[int] = Field(default=None, ge=0, le=10000)
+    titleName: Optional[str] = Field(default=None, max_length=300)
+    lang: Optional[str] = Field(default=None, max_length=12)
+
+    @field_validator("slug")
+    @classmethod
+    def slug_ok(cls, value: str) -> str:
+        return validate_slug(value)
+
+    @field_validator("type")
+    @classmethod
+    def type_ok(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+        if cleaned not in ("movie", "tv", "series"):
+            raise ValueError("type must be 'movie' or 'tv'")
+        return "tv" if cleaned == "series" else cleaned
+
+    @field_validator("titleName")
+    @classmethod
+    def title_ok(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        cleaned = value.replace("<", "").replace(">", "").replace("\x00", "").strip()
+        return cleaned[:300] or None
+
+    @field_validator("lang")
+    @classmethod
+    def lang_ok(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        cleaned = value.strip().lower()
+        if not cleaned:
+            return None
+        if not all(c.isalpha() or c == "-" for c in cleaned) or len(cleaned) > 10:
+            raise ValueError("invalid language code")
+        return cleaned
 
 
 class CreatePartyRequest(BaseModel):
@@ -233,6 +297,8 @@ class PartyRoom:
         is_new = False
         async with self.lock:
             if account_id not in self.members:
+                if len(self.members) >= MAX_ROOM_MEMBERS:
+                    raise HTTPException(status_code=403, detail="Watch party room is full")
                 new_member = {
                     "id": account_id,
                     "name": account["name"],
@@ -300,6 +366,18 @@ class PartyManager:
 
     async def create_room(self, media: MediaPayload, host_account: Dict[str, Any], initial_time: float = 0.0) -> PartyRoom:
         async with self._lock:
+            if len(self.rooms) >= MAX_ACTIVE_ROOMS:
+                # Evict stale rooms without active connections
+                now_ts = time.time()
+                stale_codes = [
+                    c for c, r in self.rooms.items()
+                    if not r.connections and (now_ts - r.last_activity) > 120.0
+                ]
+                for c in stale_codes:
+                    self.rooms.pop(c, None)
+                if len(self.rooms) >= MAX_ACTIVE_ROOMS:
+                    raise HTTPException(status_code=503, detail="Maximum active watch party rooms reached")
+
             for _ in range(10):
                 code = generate_room_code()
                 if code not in self.rooms:
@@ -314,7 +392,10 @@ class PartyManager:
             return room
 
     async def get_room(self, code: str) -> Optional[PartyRoom]:
-        return self.rooms.get(code.upper().strip())
+        clean = validate_room_code(code)
+        if not clean:
+            return None
+        return self.rooms.get(clean)
 
     async def remove_room_if_empty(self, code: str, delay_seconds: float = 120.0):
         """Wait a grace period (e.g. 120s) before removing an empty room to survive page reloads and brief reconnects."""
@@ -480,7 +561,23 @@ async def apply_room_event(
 # REST Endpoints
 # --------------------------------------------------------------------------- #
 
-@router.post("/create", response_model=PartyRoomState)
+@router.get("/ws-ticket")
+async def get_ws_ticket_endpoint(
+    raw_account: Optional[Dict[str, Any]] = Depends(get_party_account_optional),
+) -> Dict[str, Any]:
+    """Issue a short-lived HMAC-signed WebSocket authentication ticket so the
+    raw httpOnly session token never has to be exposed to browser JavaScript.
+    """
+    if not raw_account:
+        return {"ticket": None}
+    return {"ticket": create_ws_ticket(int(raw_account["id"]))}
+
+
+@router.post(
+    "/create",
+    response_model=PartyRoomState,
+    dependencies=[Depends(limit_requests("party_create", 15, 60.0))],
+)
 async def create_party_endpoint(
     body: CreatePartyRequest,
     raw_account: Optional[Dict[str, Any]] = Depends(get_party_account_optional),
@@ -698,8 +795,12 @@ async def handle_party_websocket(
     try:
         while True:
             data_text = await websocket.receive_text()
+            if len(data_text) > MAX_WS_MESSAGE_CHARS:
+                continue
             try:
                 msg = json.loads(data_text)
+                if not isinstance(msg, dict):
+                    continue
             except Exception:
                 continue
 

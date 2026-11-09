@@ -26,6 +26,16 @@ from PIL import Image
 from io import BytesIO
 
 from db import connect, now
+from security import (
+    limit_requests,
+    resolve_safe_upload_path,
+    sanitize_avatar_url,
+    sanitize_display_name,
+    validate_safe_external_url,
+)
+
+# Guard against decompression bomb DoS in uploaded profile pictures (max ~4096x4096)
+Image.MAX_IMAGE_PIXELS = 16_777_216
 
 log = logging.getLogger("streaming-dashboard")
 
@@ -49,6 +59,7 @@ LOCKOUT_MINUTES = int(os.environ.get("SC_LOCKOUT_MINUTES", "15"))
 SESSION_MS = SESSION_DAYS * 86_400_000
 LOCKOUT_MS = LOCKOUT_MINUTES * 60_000
 MAX_FAILED_ATTEMPTS = 5
+MAX_TOTAL_ACCOUNTS = int(os.environ.get("SC_MAX_ACCOUNTS", "200"))
 DEFAULT_COLOR = "#6366f1"
 
 ADMIN_NAME = os.environ.get("SC_ADMIN_NAME", "Admin")
@@ -163,16 +174,25 @@ COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}")
 
 
 def check_name(value: str) -> str:
-    name = value.strip()
-    if not name:
-        raise ValueError("name must not be blank")
-    return name
+    return sanitize_display_name(value, max_length=40)
 
 
 def check_color(value: str) -> str:
     if not COLOR_RE.fullmatch(value):
         raise ValueError("color must be #rrggbb")
     return value.lower()
+
+
+def check_picture_url(value: Optional[str]) -> Optional[str]:
+    if value is None or value == "":
+        return None
+    val = value.strip()
+    if val.startswith("/profile-pictures/"):
+        cleaned = sanitize_avatar_url(val)
+        if not cleaned:
+            raise ValueError("Invalid local profile picture path")
+        return cleaned
+    return validate_safe_external_url(val, require_https=False, max_length=500)
 
 
 class LoginRequest(BaseModel):
@@ -196,6 +216,11 @@ class AccountCreate(BaseModel):
     @classmethod
     def color_ok(cls, value: str) -> str:
         return check_color(value)
+
+    @field_validator("profile_picture")
+    @classmethod
+    def picture_ok(cls, value: Optional[str]) -> Optional[str]:
+        return check_picture_url(value)
 
 
 class RegistrationRequest(BaseModel):
@@ -225,6 +250,11 @@ class AccountPatch(BaseModel):
     def color_ok(cls, value: Optional[str]) -> Optional[str]:
         return None if value is None else check_color(value)
 
+    @field_validator("profile_picture")
+    @classmethod
+    def picture_ok(cls, value: Optional[str]) -> Optional[str]:
+        return check_picture_url(value)
+
 
 class PasswordReset(BaseModel):
     password: str = Field(min_length=6, max_length=200)
@@ -236,11 +266,7 @@ class ProfilePictureUrl(BaseModel):
     @field_validator("picture")
     @classmethod
     def picture_ok(cls, value: Optional[str]) -> Optional[str]:
-        if value is None or value == "":
-            return None
-        if not (value.startswith("http://") or value.startswith("https://")):
-            raise ValueError("picture must be an https url")
-        return value
+        return check_picture_url(value)
 
 
 def _locked(row: Dict[str, Any], stamp: int) -> bool:
@@ -294,7 +320,7 @@ def create_session(account_id: int) -> str:
         return _open_session(conn, account_id, now())
 
 
-@router.post("/auth/login")
+@router.post("/auth/login", dependencies=[Depends(limit_requests("auth_login", 15, 60.0))])
 def login(body: LoginRequest) -> Dict[str, Any]:
     stamp = now()
     outcome: Dict[str, Any] = {}
@@ -357,11 +383,21 @@ def login(body: LoginRequest) -> Dict[str, Any]:
     return outcome
 
 
-@router.post("/auth/register", status_code=201)
+@router.post(
+    "/auth/register",
+    status_code=201,
+    dependencies=[Depends(limit_requests("auth_register", 5, 600.0))],
+)
 def register(body: RegistrationRequest) -> Dict[str, Any]:
     """Create a member account without requiring an existing session."""
     try:
         with connect() as conn:
+            total = conn.execute("SELECT COUNT(*) AS n FROM accounts").fetchone()["n"]
+            if total >= MAX_TOTAL_ACCOUNTS:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Maximum number of accounts reached on this server",
+                )
             cursor = conn.execute(
                 """
                 INSERT INTO accounts (name, password_hash, role, color, created_at)
@@ -539,29 +575,35 @@ def change_own_picture_upload(
             detail=f"File too large. Maximum is {MAX_PROFILE_PICTURE_MB} MB",
         )
 
-    # Validate it's a real image via Pillow.
+    # Validate it's a real image via Pillow and strip all EXIF/metadata.
     try:
         img = Image.open(BytesIO(contents))
         img.load()
-        if img.format not in ("JPEG", "PNG"):
+        orig_format = img.format
+        if orig_format not in ("JPEG", "PNG"):
             raise HTTPException(status_code=400, detail="File does not appear to be a valid JPEG or PNG image")
-        # Normalise to RGB for JPEG compatibility and constrain size.
+        # Normalise to RGB and constrain size.
         max_dim = 512
         if img.width > max_dim or img.height > max_dim:
             ratio = min(max_dim / img.width, max_dim / img.height)
-            new_size = (int(img.width * ratio), int(img.height * ratio))
+            new_size = (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
             img = img.resize(new_size, Image.LANCZOS)
-        if img.mode in ("RGBA", "P"):
+        if img.mode != "RGB":
             img = img.convert("RGB")
+        # Rebuild clean image buffer without EXIF / GPS / comment metadata
+        clean_img = Image.new("RGB", img.size)
+        clean_img.paste(img)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail="File is not a readable image") from exc
 
-    # Save the file.
+    # Save the file with canonical path validation.
     out_dir = UPLOAD_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
-    stored_name = f"{account['id']}{ext}"
-    out_path = out_dir / stored_name
-    img.save(out_path, format=img.format, optimize=True)
+    stored_name = f"{int(account['id'])}{ext}"
+    out_path = resolve_safe_upload_path(out_dir, stored_name)
+    clean_img.save(out_path, format=orig_format, optimize=True)
 
     # Build the public URL the dashboard will use.
     # Strip trailing slash so the user can set SC_BASE_URL with or without one.
@@ -668,15 +710,20 @@ def admin_set_picture_upload(
     try:
         img = Image.open(BytesIO(contents))
         img.load()
-        if img.format not in ("JPEG", "PNG"):
+        orig_format = img.format
+        if orig_format not in ("JPEG", "PNG"):
             raise HTTPException(status_code=400, detail="File does not appear to be a valid JPEG or PNG image")
         max_dim = 512
         if img.width > max_dim or img.height > max_dim:
             ratio = min(max_dim / img.width, max_dim / img.height)
-            new_size = (int(img.width * ratio), int(img.height * ratio))
+            new_size = (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
             img = img.resize(new_size, Image.LANCZOS)
-        if img.mode in ("RGBA", "P"):
+        if img.mode != "RGB":
             img = img.convert("RGB")
+        clean_img = Image.new("RGB", img.size)
+        clean_img.paste(img)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail="File is not a readable image") from exc
 
@@ -685,10 +732,10 @@ def admin_set_picture_upload(
         if found is None:
             raise HTTPException(status_code=404, detail="No such account")
 
-        stored_name = f"{account_id}{ext}"
-        out_path = UPLOAD_DIR / stored_name
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        img.save(out_path, format=img.format, optimize=True)
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        stored_name = f"{int(account_id)}{ext}"
+        out_path = resolve_safe_upload_path(UPLOAD_DIR, stored_name)
+        clean_img.save(out_path, format=orig_format, optimize=True)
         # Strip trailing slash so the user can set SC_BASE_URL with or without one.
         base = (SC_BASE_URL or f"{request.base_url.scheme}://{request.base_url.netloc}").rstrip("/")
         picture_url = f"{base}/profile-pictures/{stored_name}"

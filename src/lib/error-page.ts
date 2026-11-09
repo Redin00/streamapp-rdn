@@ -1,4 +1,15 @@
+function escapeHtml(input: string): string {
+  return input
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 export function renderErrorPage(diagnostic?: string): string {
+  const isProd = process.env["NODE_ENV"] === "production";
+  const safeDiagnostic = !isProd && diagnostic ? escapeHtml(diagnostic) : "";
   return `<!doctype html>
 <html lang="en">
   <head>
@@ -20,7 +31,7 @@ export function renderErrorPage(diagnostic?: string): string {
   <body>
     <div class="card">
       <h1>This page didn't load</h1>
-      <pre class="mb-4">${diagnostic ?? ""}</pre>
+      ${safeDiagnostic ? `<pre class="mb-4">${safeDiagnostic}</pre>` : ""}
       <p>Something went wrong on our end. You can try refreshing or head back home.</p>
       <div class="actions">
         <button class="primary" onclick="location.reload()">Try again</button>
