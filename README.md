@@ -16,6 +16,16 @@ metadata and **Vixsrc** for streaming availability and playback via direct HLS s
 
 You need Node.js and npm — [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating) — plus Python 3.10+.
 
+> [!NOTE]
+> **Python prerequisites (Linux & Windows)**:
+> - **Linux**: make sure `python3`, **`python3-venv`**, and **`python3-pip`** (plus standard development headers if needed by native wheels) are installed before running `npm run dev`:
+>   - **Debian / Ubuntu / Mint**: `sudo apt update && sudo apt install -y python3 python3-venv python3-pip python3-dev`
+>   - **Fedora / RHEL**: `sudo dnf install -y python3 python3-pip python3-devel`
+>   - **Arch Linux**: `sudo pacman -S python python-pip`
+> - **Windows**: install Python 3.10+ from [python.org](https://www.python.org/downloads/windows/) (or via terminal with `winget install -e --id Python.Python.3.12`).
+>   - Make sure to check **"Add python.exe to PATH"** in the installer; both `venv` and `pip` are bundled automatically on Windows (keep **pip** checked under *Optional Features*).
+>   - For Node.js on Windows, use [nvm-windows](https://github.com/coreybutler/nvm-windows) or the official LTS installer from [nodejs.org](https://nodejs.org/).
+
 ```sh
 git clone https://github.com/Redin00/streamapp-rdn
 cd streamapp-rdn/

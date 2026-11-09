@@ -15,6 +15,16 @@ stagioni, episodi, cast e trailer in italiano. Il sistema combina **The Movie Da
 
 Servono Node.js e npm — [installabili con nvm](https://github.com/nvm-sh/nvm#installing-and-updating) — e Python 3.10 o superiore.
 
+> [!NOTE]
+> **Prerequisiti Python (Linux & Windows)**:
+> - **Linux**: assicurati che siano installati `python3`, **`python3-venv`**, **`python3-pip`** (e i relativi pacchetti di base per gli ambienti virtuali):
+>   - **Debian / Ubuntu / Mint**: `sudo apt update && sudo apt install -y python3 python3-venv python3-pip python3-dev`
+>   - **Fedora / RHEL**: `sudo dnf install -y python3 python3-pip python3-devel`
+>   - **Arch Linux**: `sudo pacman -S python python-pip`
+> - **Windows**: installa Python 3.10+ dal [sito ufficiale python.org](https://www.python.org/downloads/windows/) (oppure tramite terminale con `winget install -e --id Python.Python.3.12`).
+>   - Durante l'installazione spunta obbligatoriamente **"Add python.exe to PATH"**; i moduli `venv` e `pip` sono già inclusi nell'installer ufficiale di Windows (assicurati che la voce **pip** sia selezionata nelle *Optional Features*).
+>   - Per Node.js su Windows puoi usare [nvm-windows](https://github.com/coreybutler/nvm-windows) oppure l'installer LTS da [nodejs.org](https://nodejs.org/).
+
 ```sh
 git clone https://github.com/Redin00/streamapp-rdn
 cd streamapp-rdn/

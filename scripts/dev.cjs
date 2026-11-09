@@ -56,12 +56,16 @@ function log(source, color, msg) {
 
 function findSystemPython() {
   const candidates =
-    process.platform === "win32" ? ["python.exe", "python"] : ["python3", "python"];
+    process.platform === "win32" ? ["python.exe", "python", "py"] : ["python3", "python"];
   for (const cmd of candidates) {
     const result = spawnSync(cmd, ["--version"], { shell: true, stdio: "pipe" });
     if (result.status === 0) return cmd;
   }
-  throw new Error("Python 3 is required but was not found. Please install Python 3 and try again.");
+  const osHint =
+    process.platform === "win32"
+      ? " On Windows, install Python 3.10+ from https://www.python.org/downloads/windows/ (check 'Add python.exe to PATH' and 'pip') or run: winget install -e --id Python.Python.3.12"
+      : " On Linux (Debian/Ubuntu), run: sudo apt install python3 python3-venv python3-pip python3-dev";
+  throw new Error(`Python 3 is required but was not found.${osHint}`);
 }
 
 function getVenvPython() {
@@ -93,7 +97,13 @@ function ensureVenv() {
     stdio: "inherit",
   });
   if (create.status !== 0) {
-    throw new Error("Failed to create Python virtual environment.");
+    const osHint =
+      process.platform === "linux"
+        ? " On Linux (Debian/Ubuntu), make sure python3-venv and python3-pip are installed: sudo apt install python3 python3-venv python3-pip python3-dev"
+        : process.platform === "win32"
+          ? " On Windows, make sure Python 3.10+ was installed from python.org (or winget) with 'Add python.exe to PATH' and 'pip' enabled."
+          : "";
+    throw new Error(`Failed to create Python virtual environment.${osHint}`);
   }
   return getVenvPython();
 }
