@@ -62,8 +62,9 @@ MAX_FAILED_ATTEMPTS = 5
 MAX_TOTAL_ACCOUNTS = int(os.environ.get("SC_MAX_ACCOUNTS", "200"))
 DEFAULT_COLOR = "#6366f1"
 
-ADMIN_NAME = os.environ.get("SC_ADMIN_NAME", "Admin")
-ADMIN_PASSWORD = os.environ.get("SC_ADMIN_PASSWORD")
+DEFAULT_ADMIN_PASSWORD = "admin123"
+ADMIN_NAME = (os.environ.get("SC_ADMIN_NAME") or "").strip() or "Admin"
+ADMIN_PASSWORD = (os.environ.get("SC_ADMIN_PASSWORD") or "").strip() or DEFAULT_ADMIN_PASSWORD
 
 router = APIRouter()
 bearer = HTTPBearer(auto_error=False)
@@ -778,8 +779,8 @@ def delete_account(account_id: int, admin: Dict[str, Any] = Depends(require_admi
 
 def bootstrap_admin() -> None:
     """Seed the first admin, so a fresh install is never an app nobody can enter."""
-    generated = not ADMIN_PASSWORD
-    password = ADMIN_PASSWORD or secrets.token_urlsafe(12)
+    using_default = not (os.environ.get("SC_ADMIN_PASSWORD") or "").strip()
+    password = ADMIN_PASSWORD
 
     with connect() as conn:
         if _admin_count(conn):
@@ -792,12 +793,12 @@ def bootstrap_admin() -> None:
             (ADMIN_NAME, hash_password(password), DEFAULT_COLOR, now()),
         )
 
-    if generated:
+    if using_default:
         log.warning(
-            "no SC_ADMIN_PASSWORD set — generated the password for admin %r: %s "
-            "(change it from the Admin page)",
+            "no SC_ADMIN_PASSWORD set — bootstrapped admin %r with default password %r "
+            "(change it from the Admin page or set SC_ADMIN_PASSWORD in .env)",
             ADMIN_NAME,
-            password,
+            DEFAULT_ADMIN_PASSWORD,
         )
     else:
         log.info("bootstrapped admin account %r", ADMIN_NAME)

@@ -33,21 +33,24 @@ npm i
 npm run dev
 ```
 
-Copia `.env.example` in `.env` nella cartella principale e imposta la tua `TMDB_API_KEY`.
-`npm run dev` carica quel file sia per il servizio Python sia per Vite; le variabili esportate nella shell hanno la precedenza.
-
-`npm run dev` avvia sia il servizio API Python che il server Vite, collegandoli automaticamente tramite `STREAMING_API_URL`. È possibile avviare il servizio Python manualmente: consulta [`python-service/README.md`](./python-service/README.md) per i dettagli.
+Copia `.env.example` in `.env` nella cartella principale: l'app è già pronta all'uso fin da subito con valori predefiniti funzionanti!
+`npm run dev` carica automaticamente il file `.env` sia per il servizio Python sia per Vite (le variabili già esportate nella shell hanno la precedenza) e collega i due servizi tramite `STREAMING_API_URL`. È comunque possibile avviare il servizio Python manualmente: consulta [`python-service/README.md`](./python-service/README.md) per i dettagli.
 
 > [!IMPORTANT]
-> È necessaria una **Chiave API TMDB** gratuita per visualizzare metadati, ricerca e locandine.
+> **Credenziali Admin Predefinite**:
+> Al primo avvio viene creato automaticamente il profilo amministratore predefinito:
+> - **Profilo**: `Admin`
+> - **Password**: `admin123`
+>
+> Puoi modificare la password in qualsiasi momento dalla pagina `/admin` (o dalle impostazioni del profilo) oppure personalizzarla prima del primo avvio tramite `SC_ADMIN_PASSWORD` nel file `.env`.
+
+> [!TIP]
+> **Chiave API TMDB (Opzionale ma consigliata)**:
+> Non è obbligatorio inserire una `TMDB_API_KEY` per iniziare: se lasciata vuota, il sistema utilizza automaticamente una **chiave TMDB predefinita integrata** per far funzionare subito catalogo, ricerca e locandine.
+> Per un utilizzo continuativo o in caso di hosting pubblico è comunque consigliabile inserire la propria chiave gratuita:
 > 1. Crea un account gratuito su [themoviedb.org](https://www.themoviedb.org/signup).
-> 2. Genera una chiave API (v3 API key o v4 Read Access Token) in [Impostazioni TMDB > API](https://www.themoviedb.org/settings/api).
-> 3. Inseriscila nel tuo `.env`: `TMDB_API_KEY=la_tua_chiave`.
-
-> [!IMPORTANT]
-> Se `SC_ADMIN_PASSWORD` nel file `.env` è vuota, il servizio genera una
-> password amministratore e la stampa nei log **una sola volta**, quando viene creato il database.
-> Salva la password oppure imposta `SC_ADMIN_PASSWORD` prima del primo avvio.
+> 2. Genera una chiave API in [Impostazioni TMDB > API](https://www.themoviedb.org/settings/api).
+> 3. Inseriscila nel file `.env`: `TMDB_API_KEY=la_tua_chiave`.
 
 > [!NOTE]
 > Il dominio di riproduzione Vixsrc può cambiare nel tempo (predefinito: `vixsrc.to`).
@@ -58,14 +61,14 @@ Copia `.env.example` in `.env` nella cartella principale e imposta la tua `TMDB_
 
 | Variabile            | Valore predefinito                 | Descrizione                                             |
 | -------------------- | ---------------------------------- | ------------------------------------------------------- |
-| `TMDB_API_KEY`       | vuoto                              | Chiave API / Access Token TMDB (richiesto per metadati) |
+| `TMDB_API_KEY`       | chiave integrata di default        | Chiave API TMDB (opzionale; consigliata una personale)  |
 | `SC_PORT`            | `8000`                             | Porta locale del servizio Python                        |
 | `SC_VIXSRC_DOMAIN`   | `vixsrc.to`                        | Host iniziale/fallback di riproduzione e catalogo (se modificato da `/admin`, il DB ha la priorità) |
 | `SC_CACHE_TTL`       | `1800`                             | Durata della cache delle risposte, in secondi (30m)     |
 | `SC_LOG_LEVEL`       | `INFO`                             | Livello dei log Python (`DEBUG` per più dettagli)       |
 | `SC_DB_PATH`         | `python-service/data/streamapp.db` | Account, sessioni, libreria e cronologia                |
 | `SC_ADMIN_NAME`      | `Admin`                            | Nome del primo profilo amministratore                   |
-| `SC_ADMIN_PASSWORD`  | generata e mostrata nei log        | Password del primo profilo amministratore               |
+| `SC_ADMIN_PASSWORD`  | `admin123`                         | Password iniziale del primo profilo amministratore      |
 | `SC_SESSION_DAYS`    | `30`                               | Durata di validità di una sessione                      |
 | `SC_LOCKOUT_MINUTES` | `15`                               | Blocco dopo cinque accessi falliti                      |
 | `SC_BASE_URL`        | vuoto                              | URL pubblico per i link alle immagini profilo           |
@@ -78,10 +81,9 @@ Il file `.env.example` principale contiene tutte le variabili di configurazione 
 ## Account
 
 Ogni pagina passa dal selettore di profili in stile Netflix disponibile su
-`/login`. In un database vuoto il servizio crea un amministratore usando
-`SC_ADMIN_NAME` e `SC_ADMIN_PASSWORD`, oppure una password generata e stampata
-una sola volta nei log. Solo un amministratore può creare altri profili da
-`/admin`. Dopo cinque password errate, il profilo viene bloccato per
+`/login`. In un database vuoto il servizio crea il profilo amministratore predefinito
+(`Admin` con password standard `admin123`, salvo diversa configurazione in `SC_ADMIN_NAME` e `SC_ADMIN_PASSWORD`).
+L'amministratore può creare o gestire altri profili da `/admin` (oltre alla registrazione pubblica dei profili membro). Dopo cinque password errate, il profilo viene bloccato per
 `SC_LOCKOUT_MINUTES`; un amministratore può sbloccarlo prima.
 
 Account, sessioni, titoli salvati e cronologia di visione sono conservati nel

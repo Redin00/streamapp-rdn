@@ -49,7 +49,8 @@ URL (e.g. `http://localhost:8000`).
 For local development, configure the service from the repository-root `.env`
 file. Copy `../.env.example` to `../.env`; `npm run dev` loads it automatically.
 
-Make sure to set `TMDB_API_KEY` in `.env` (free at https://www.themoviedb.org/settings/api).
+- **Default Admin**: `Admin` / `admin123` (configurable via `SC_ADMIN_NAME` and `SC_ADMIN_PASSWORD` in `.env`).
+- **TMDB API Key**: Optional — a built-in default `TMDB_API_KEY` is used automatically if left empty, though setting your own free key in `.env` (from https://www.themoviedb.org/settings/api) is recommended.
 
 ## Endpoints
 
