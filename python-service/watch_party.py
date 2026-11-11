@@ -113,12 +113,40 @@ def resolve_party_participant(
     guest_name: Optional[str] = None,
     guest_color: Optional[str] = None,
     guest_avatar: Optional[str] = None,
+    room: Optional["PartyRoom"] = None,
 ) -> Dict[str, Any]:
-    """Return the authenticated account or build a stable, sanitized guest participant."""
-    if account:
-        return account
+    """Return the authenticated account or build a stable, sanitized guest participant.
 
+    If two different devices/browsers (distinguished by `guest_id`) join the same room
+    while logged into the same account (e.g. both using the default `Admin` profile),
+    the second device is assigned a distinct participant ID so both devices can sync
+    independently without colliding.
+    """
     gid = (guest_id or "").strip()[:64]
+
+    if account:
+        base_id = int(account["id"])
+        if room is not None and gid:
+            bound_gid = room.member_client_ids.get(base_id)
+            if bound_gid is None:
+                room.member_client_ids[base_id] = gid
+            elif bound_gid != gid:
+                # Another device is already in this room under the same account ID.
+                # Derive a deterministic device-scoped participant ID for this second device.
+                device_id = (abs(hash(f"acct-{base_id}-{gid}")) % 900000) + 100000
+                if device_id == base_id:
+                    device_id += 1
+                room.member_client_ids[device_id] = gid
+                return {
+                    **account,
+                    "id": device_id,
+                    "_client_id": gid,
+                }
+        return {
+            **account,
+            "_client_id": gid,
+        }
+
     if not gid:
         gid = f"guest-{secrets.token_hex(4)}"
 
@@ -139,6 +167,7 @@ def resolve_party_participant(
         "profile_picture": avatar,
         "profilePicture": avatar,
         "isGuest": True,
+        "_client_id": gid,
     }
 
 
@@ -258,6 +287,10 @@ class PartyRoom:
             }
         }
         self.member_last_seen: Dict[int, float] = {host_account["id"]: time.time()}
+        self.member_client_ids: Dict[int, str] = {}
+        if host_account.get("_client_id"):
+            self.member_client_ids[host_account["id"]] = str(host_account["_client_id"])
+        self.last_explicit_event_at: float = 0.0
         # account_id -> set of active WebSockets (supports multiple tabs / reconnects)
         self.connections: Dict[int, Set[WebSocket]] = {}
         # Recent chat messages persisted in memory for participants who join or reconnect
@@ -437,11 +470,12 @@ async def apply_room_event(
     if event_type == "PLAY":
         async with room.lock:
             room.state.isPlaying = True
-            room.state.time = cur_time
+            room.state.time = max(0.0, cur_time)
             room.state.lastUpdated = int(time.time() * 1000)
+            room.last_explicit_event_at = time.time()
         event = {
             "type": "PLAY",
-            "time": cur_time,
+            "time": room.state.time,
             "senderId": account_id,
             "senderName": account["name"],
             "timestamp": room.state.lastUpdated,
@@ -452,11 +486,12 @@ async def apply_room_event(
     elif event_type == "PAUSE":
         async with room.lock:
             room.state.isPlaying = False
-            room.state.time = cur_time
+            room.state.time = max(0.0, cur_time)
             room.state.lastUpdated = int(time.time() * 1000)
+            room.last_explicit_event_at = time.time()
         event = {
             "type": "PAUSE",
-            "time": cur_time,
+            "time": room.state.time,
             "senderId": account_id,
             "senderName": account["name"],
             "timestamp": room.state.lastUpdated,
@@ -466,11 +501,12 @@ async def apply_room_event(
 
     elif event_type == "SEEK":
         async with room.lock:
-            room.state.time = cur_time
+            room.state.time = max(0.0, cur_time)
             room.state.lastUpdated = int(time.time() * 1000)
+            room.last_explicit_event_at = time.time()
         event = {
             "type": "SEEK",
-            "time": cur_time,
+            "time": room.state.time,
             "senderId": account_id,
             "senderName": account["name"],
             "timestamp": room.state.lastUpdated,
@@ -480,13 +516,17 @@ async def apply_room_event(
 
     elif event_type == "SYNC_TICK":
         if account_id == room.host_id:
+            # Ignore stale host heartbeats right after an explicit SEEK / PLAY / PAUSE / CHANGE_MEDIA
+            # so a guest's or host's backward seek is never overwritten by an in-flight tick.
+            if (time.time() - room.last_explicit_event_at) < 4.5:
+                return None
             async with room.lock:
-                room.state.time = cur_time
+                room.state.time = max(0.0, cur_time)
                 room.state.isPlaying = bool(msg.get("isPlaying", room.state.isPlaying))
                 room.state.lastUpdated = int(time.time() * 1000)
             event = {
                 "type": "SYNC_TICK",
-                "time": cur_time,
+                "time": room.state.time,
                 "isPlaying": room.state.isPlaying,
                 "timestamp": room.state.lastUpdated,
             }
@@ -499,7 +539,7 @@ async def apply_room_event(
         if new_media_raw:
             try:
                 new_media = MediaPayload(**new_media_raw)
-                time_val = float(msg.get("time", 0.0))
+                time_val = max(0.0, float(msg.get("time", 0.0)))
                 # If changing media (different slug, season, or episode), always reset time to 0.0
                 is_different_media = (
                     room.media is None
@@ -515,6 +555,7 @@ async def apply_room_event(
                     room.state.time = time_val
                     room.state.isPlaying = False
                     room.state.lastUpdated = int(time.time() * 1000)
+                    room.last_explicit_event_at = time.time()
                 event = {
                     "type": "CHANGE_MEDIA",
                     "media": new_media.model_dump(),
@@ -630,6 +671,7 @@ async def post_party_event_endpoint(
         guest_name=g_name,
         guest_color=g_color,
         guest_avatar=g_avatar,
+        room=room,
     )
     await room.ensure_member(account)
     event_payload = body.get("event") if isinstance(body.get("event"), dict) else body
@@ -663,6 +705,7 @@ async def poll_party_endpoint(
         guest_name=guest_name,
         guest_color=guest_color,
         guest_avatar=guest_avatar,
+        room=room,
     )
     await room.ensure_member(account)
     since_int = int(since)
@@ -686,11 +729,12 @@ async def leave_party_endpoint(
     room = await party_manager.get_room(code)
     if not room:
         return {"ok": True}
-    account = resolve_party_participant(account=raw_account, guest_id=guest_id)
+    account = resolve_party_participant(account=raw_account, guest_id=guest_id, room=room)
     account_id = account["id"]
     async with room.lock:
         room.members.pop(account_id, None)
         room.member_last_seen.pop(account_id, None)
+        room.member_client_ids.pop(account_id, None)
         if account_id in room.connections:
             for ws in list(room.connections[account_id]):
                 try:
@@ -757,16 +801,6 @@ async def handle_party_websocket(
         except Exception:
             pass
 
-    # If still not authenticated, resolve as participant / guest
-    if not account:
-        account = resolve_party_participant(
-            account=None,
-            guest_id=guest_id,
-            guest_name=guest_name,
-            guest_color=guest_color,
-            guest_avatar=guest_avatar,
-        )
-
     # 2. Join the room
     clean_code = code.upper().strip()
     room = await party_manager.get_room(clean_code)
@@ -774,6 +808,16 @@ async def handle_party_websocket(
         await websocket.send_text(json.dumps({"type": "ERROR", "message": "Room not found"}))
         await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
         return
+
+    # Resolve participant with room context (handles both guests and multi-device same-account)
+    account = resolve_party_participant(
+        account=account if (account and not account.get("isGuest")) else None,
+        guest_id=guest_id,
+        guest_name=guest_name,
+        guest_color=guest_color,
+        guest_avatar=guest_avatar,
+        room=room,
+    )
 
     account_id = account["id"]
     await room.ensure_member(account)

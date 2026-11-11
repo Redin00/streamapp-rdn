@@ -49,11 +49,11 @@ export type PartyEvent =
   | { type: "MEMBER_JOINED"; member: PartyMember; members: PartyMember[] }
   | { type: "MEMBER_LEFT"; memberId: number; members: PartyMember[] }
   | { type: "HOST_CHANGED"; newHostId: number; members: PartyMember[] }
-  | { type: "PLAY"; time: number; senderId: number; senderName: string }
-  | { type: "PAUSE"; time: number; senderId: number; senderName: string }
-  | { type: "SEEK"; time: number; senderId: number; senderName: string }
+  | { type: "PLAY"; time: number; senderId: number; senderName: string; timestamp?: number }
+  | { type: "PAUSE"; time: number; senderId: number; senderName: string; timestamp?: number }
+  | { type: "SEEK"; time: number; senderId: number; senderName: string; timestamp?: number }
   | { type: "SYNC_TICK"; time: number; isPlaying: boolean; timestamp: number }
-  | { type: "CHANGE_MEDIA"; media: PartyMedia; time: number; senderId: number; senderName: string }
+  | { type: "CHANGE_MEDIA"; media: PartyMedia; time: number; senderId: number; senderName: string; timestamp?: number }
   | {
       type: "CHAT";
       id?: string;

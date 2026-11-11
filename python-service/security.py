@@ -378,16 +378,18 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """Attach defensive HTTP security headers and global IP rate limit to every response."""
 
     async def dispatch(self, request: Request, call_next) -> Response:
-        # Global per-IP flood protection (300 requests / 60s)
-        try:
-            rate_limiter.check(request, "global", 300, 60.0)
-        except HTTPException as exc:
-            return Response(
-                content='{"detail":"Too many requests"}',
-                status_code=exc.status_code,
-                media_type="application/json",
-                headers=exc.headers or {},
-            )
+        path = request.url.path
+        # Global per-IP flood protection (exempting real-time Watch Party sync polling)
+        if not path.startswith("/party/"):
+            try:
+                rate_limiter.check(request, "global", 600, 60.0)
+            except HTTPException as exc:
+                return Response(
+                    content='{"detail":"Too many requests"}',
+                    status_code=exc.status_code,
+                    media_type="application/json",
+                    headers=exc.headers or {},
+                )
 
         response: Response = await call_next(request)
 

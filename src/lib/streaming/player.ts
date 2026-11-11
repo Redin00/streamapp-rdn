@@ -30,7 +30,7 @@ export function buildEmbedUrl(config: PlayerConfig, target: EmbedTarget): string
   }
 
   const url = new URL(path, `https://${host}`);
-  if (target.startAt !== undefined && target.startAt > 0) {
+  if (target.startAt !== undefined && Number.isFinite(target.startAt) && target.startAt >= 0) {
     url.searchParams.set("startAt", String(Math.floor(target.startAt)));
   }
   if (target.autoplay !== undefined) {

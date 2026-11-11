@@ -40,12 +40,15 @@ const SECURITY_HEADERS: Record<string, string> = {
   ].join("; "),
 };
 
-function withSecurityHeaders(response: Response): Response {
+function withSecurityHeaders(response: Response, requestUrl?: string): Response {
   const headers = new Headers(response.headers);
   for (const [key, value] of Object.entries(SECURITY_HEADERS)) {
     if (!headers.has(key)) {
       headers.set(key, value);
     }
+  }
+  if (requestUrl && requestUrl.includes("/_server") && !headers.has("Cache-Control")) {
+    headers.set("Cache-Control", "no-store, no-cache, must-revalidate");
   }
   if (process.env["NODE_ENV"] === "production" && !headers.has("Strict-Transport-Security")) {
     headers.set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload");
@@ -59,13 +62,13 @@ function withSecurityHeaders(response: Response): Response {
 
 // h3 swallows in-handler throws into a normal 500 Response with body
 // {"unhandled":true,"message":"HTTPError"} — try/catch alone never fires for those.
-async function normalizeCatastrophicSsrResponse(response: Response): Promise<Response> {
-  if (response.status < 500) return withSecurityHeaders(response);
+async function normalizeCatastrophicSsrResponse(response: Response, requestUrl?: string): Promise<Response> {
+  if (response.status < 500) return withSecurityHeaders(response, requestUrl);
   const contentType = response.headers.get("content-type") ?? "";
-  if (!contentType.includes("application/json")) return withSecurityHeaders(response);
+  if (!contentType.includes("application/json")) return withSecurityHeaders(response, requestUrl);
 
   const body = await response.clone().text();
-  if (!isH3SwallowedErrorBody(body)) return withSecurityHeaders(response);
+  if (!isH3SwallowedErrorBody(body)) return withSecurityHeaders(response, requestUrl);
 
   const captured = consumeLastCapturedError();
   console.error(captured ?? new Error(`h3 swallowed SSR error: ${body}`));
@@ -77,6 +80,7 @@ async function normalizeCatastrophicSsrResponse(response: Response): Promise<Res
         headers: { "content-type": "text/html; charset=utf-8" },
       },
     ),
+    requestUrl,
   );
 }
 
@@ -94,7 +98,7 @@ export default {
     try {
       const handler = await getServerEntry();
       const response = await handler.fetch(request, env, ctx);
-      return await normalizeCatastrophicSsrResponse(response);
+      return await normalizeCatastrophicSsrResponse(response, request.url);
     } catch (error) {
       console.error(error);
       return withSecurityHeaders(
@@ -102,6 +106,7 @@ export default {
           status: 500,
           headers: { "content-type": "text/html; charset=utf-8" },
         }),
+        request.url,
       );
     }
   },

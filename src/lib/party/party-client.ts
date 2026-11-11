@@ -55,7 +55,7 @@ interface UseWatchPartyOptions {
   roomCode: string | null;
   initialRoom?: WatchPartyRoom | null;
   viewer?: PartyViewerInfo | null;
-  onRemotePlay?: (time: number) => void;
+  onRemotePlay?: (time: number, isSyncTick?: boolean) => void;
   onRemotePause?: (time: number) => void;
   onRemoteSeek?: (time: number) => void;
   onRemoteMediaChange?: (media: PartyMedia, roomCode?: string) => void;
@@ -451,8 +451,8 @@ export function useWatchParty({
         }
 
         if (active && !isDeadRoomRef.current) {
-          // If WS is open, poll rarely as fallback backup; otherwise poll every 1.5s
-          const nextDelay = wsConnectedRef.current ? 10000 : 1500;
+          // If WS is open, poll rarely as fallback backup; otherwise poll every 1.0s
+          const nextDelay = wsConnectedRef.current ? 10000 : 1000;
           pollTimerRef.current = setTimeout(doPoll, nextDelay);
         } else {
           isPollingRef.current = false;
@@ -514,16 +514,18 @@ export function useWatchParty({
             setIsConnected(true);
             setIsConnecting(false);
             setError(null);
-            try {
-              ws.send(JSON.stringify({
-                type: "AUTH",
-                token: token || undefined,
-                guestId,
-                guestName: viewer?.name,
-                guestColor: viewer?.color,
-                guestAvatar: viewer?.profilePicture,
-              }));
-            } catch {}
+            if (!token) {
+              try {
+                ws.send(JSON.stringify({
+                  type: "AUTH",
+                  token: token || undefined,
+                  guestId,
+                  guestName: viewer?.name,
+                  guestColor: viewer?.color,
+                  guestAvatar: viewer?.profilePicture,
+                }));
+              } catch {}
+            }
           };
 
           ws.onmessage = (event) => {
@@ -659,11 +661,16 @@ export function useWatchParty({
           if (isSender || isRecentLocalSend) {
             break;
           }
+          const elapsedSec =
+            typeof msg.timestamp === "number" && msg.timestamp > 0
+              ? Math.max(0, Math.min(2.5, (Date.now() - msg.timestamp) / 1000))
+              : 0;
+          const targetTime = Math.max(0, msg.time + elapsedSec);
           withRemoteSync(() => {
-            if (onRemotePlayRef.current) onRemotePlayRef.current(msg.time);
-          }, 1200);
+            if (onRemotePlayRef.current) onRemotePlayRef.current(targetTime, false);
+          }, 1600);
           setRoom((prev) =>
-            prev ? { ...prev, state: { ...prev.state, isPlaying: true, time: msg.time, lastUpdated: Date.now() } } : null,
+            prev ? { ...prev, state: { ...prev.state, isPlaying: true, time: targetTime, lastUpdated: Date.now() } } : null,
           );
           break;
         }
@@ -675,7 +682,7 @@ export function useWatchParty({
           }
           withRemoteSync(() => {
             if (onRemotePauseRef.current) onRemotePauseRef.current(msg.time);
-          }, 1200);
+          }, 1600);
           setRoom((prev) =>
             prev ? { ...prev, state: { ...prev.state, isPlaying: false, time: msg.time, lastUpdated: Date.now() } } : null,
           );
@@ -689,7 +696,7 @@ export function useWatchParty({
           }
           withRemoteSync(() => {
             if (onRemoteSeekRef.current) onRemoteSeekRef.current(msg.time);
-          }, 1200);
+          }, 1800);
           setRoom((prev) =>
             prev ? { ...prev, state: { ...prev.state, time: msg.time, lastUpdated: Date.now() } } : null,
           );
@@ -697,16 +704,25 @@ export function useWatchParty({
         }
         case "SYNC_TICK": {
           const currentRoom = roomRef.current;
+          // Ignore SYNC_TICK if this participant just initiated a local PLAY/PAUSE/SEEK within 5s
+          if (lastSentRef.current && Date.now() - lastSentRef.current.ts < 5000) {
+            break;
+          }
           if (currentRoom && currentAccountIdRef.current !== currentRoom.hostId && getCurrentTimeRef.current) {
+            const elapsedSec =
+              msg.isPlaying && typeof msg.timestamp === "number" && msg.timestamp > 0
+                ? Math.max(0, Math.min(2.5, (Date.now() - msg.timestamp) / 1000))
+                : 0;
+            const targetTime = Math.max(0, msg.time + elapsedSec);
             const current = getCurrentTimeRef.current();
-            const diff = Math.abs(current - msg.time);
+            const diff = Math.abs(current - targetTime);
             const isLocalCurrentlyPlaying = getIsPlayingRef.current ? getIsPlayingRef.current() : false;
             const playStateMismatch = isLocalCurrentlyPlaying !== msg.isPlaying;
 
             if (playStateMismatch || diff > 3.0) {
               withRemoteSync(() => {
                 if (msg.isPlaying) {
-                  if (onRemotePlayRef.current) onRemotePlayRef.current(msg.time);
+                  if (onRemotePlayRef.current) onRemotePlayRef.current(targetTime, true);
                 } else {
                   if (diff > 3.0 && onRemoteSeekRef.current) {
                     onRemoteSeekRef.current(msg.time);
@@ -715,7 +731,7 @@ export function useWatchParty({
                     onRemotePauseRef.current(msg.time);
                   }
                 }
-              }, 1200);
+              }, 1600);
             }
           }
           break;

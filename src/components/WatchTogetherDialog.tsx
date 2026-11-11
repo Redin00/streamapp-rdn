@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Crown, Loader2, LogOut, Radio, Send, Users } from "lucide-react";
+import { Check, Copy, Crown, Loader2, LogOut, Radio, Send, Share2, Users } from "lucide-react";
 
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
@@ -54,11 +54,40 @@ export function WatchTogetherDialog({
   const { t } = useTranslation();
   const [inputCode, setInputCode] = useState("");
   const [chatText, setChatText] = useState("");
+  const [copiedCode, setCopiedCode] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatMessages.length]);
+
+  const handleCopyCode = async () => {
+    if (!room?.code) return;
+    try {
+      await navigator.clipboard.writeText(room.code);
+      setCopiedCode(true);
+      setTimeout(() => setCopiedCode(false), 2000);
+    } catch {}
+  };
+
+  const handleShareParty = async () => {
+    if (!room?.code) return;
+    try {
+      const shareUrl = new URL(window.location.href);
+      shareUrl.searchParams.set("party", room.code);
+      if (navigator.share) {
+        await navigator.share({
+          title: `Watch Party (${room.code})`,
+          text: `Unisciti al Watch Party con il codice ${room.code}`,
+          url: shareUrl.toString(),
+        });
+      } else {
+        await navigator.clipboard.writeText(shareUrl.toString());
+        setCopiedCode(true);
+        setTimeout(() => setCopiedCode(false), 2000);
+      }
+    } catch {}
+  };
 
   const handleJoinSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -76,7 +105,7 @@ export function WatchTogetherDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-md p-6">
+      <DialogContent className="max-w-md max-h-[90dvh] overflow-y-auto p-5 sm:p-6">
         <DialogHeader>
           <div className="flex items-center gap-2">
             <Users className="size-5 text-primary" />
@@ -104,15 +133,35 @@ export function WatchTogetherDialog({
                   {room.code}
                 </p>
               </div>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="size-8 text-muted-foreground hover:text-destructive"
-                onClick={onLeaveParty}
-                title={t("party_leave")}
-              >
-                <LogOut className="size-4" />
-              </Button>
+              <div className="flex items-center gap-1">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="size-8 text-muted-foreground hover:text-foreground"
+                  onClick={() => void handleCopyCode()}
+                  title="Copia codice stanza"
+                >
+                  {copiedCode ? <Check className="size-4 text-emerald-500" /> : <Copy className="size-4" />}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="size-8 text-muted-foreground hover:text-foreground"
+                  onClick={() => void handleShareParty()}
+                  title="Condividi link stanza"
+                >
+                  <Share2 className="size-4" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="size-8 text-muted-foreground hover:text-destructive"
+                  onClick={onLeaveParty}
+                  title={t("party_leave")}
+                >
+                  <LogOut className="size-4" />
+                </Button>
+              </div>
             </div>
 
             {/* Status indicator */}
@@ -239,7 +288,7 @@ export function WatchTogetherDialog({
                   onChange={(e) => setChatText(e.target.value)}
                   placeholder={isConnected ? t("party_typeMessage") : t("party_syncing")}
                   disabled={!isConnected}
-                  className="h-9 text-xs"
+                  className="h-9 text-base sm:text-xs"
                 />
                 <Button
                   type="submit"
@@ -288,8 +337,11 @@ export function WatchTogetherDialog({
                     value={inputCode}
                     onChange={(e) => setInputCode(e.target.value.toUpperCase())}
                     placeholder="e.g. CINE-42"
-                    className="font-mono uppercase tracking-wider"
+                    className="font-mono text-base sm:text-sm uppercase tracking-wider"
                     maxLength={10}
+                    autoCapitalize="characters"
+                    autoCorrect="off"
+                    spellCheck={false}
                     disabled={isConnecting || isCreating}
                   />
                   <Button type="submit" disabled={!inputCode.trim() || isConnecting || isCreating}>

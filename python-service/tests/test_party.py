@@ -357,6 +357,55 @@ class TestWatchParty(unittest.TestCase):
             self.assertEqual(init_msg["type"], "ROOM_STATE")
             self.assertIn("yourAccountId", init_msg)
 
+    def test_multi_device_same_account_and_backward_seek_protection(self):
+        # 1. Device 1 (PC) creates room logged into self.account_id with guestId="device-pc"
+        payload = {
+            "media": {
+                "slug": "multi-device-test",
+                "tmdbId": 444,
+                "type": "movie",
+                "titleName": "Multi Device Movie",
+            },
+            "initialTime": 100.0,
+            "guestId": "device-pc",
+        }
+        res = self.client.post("/party/create", json=payload, headers=self.headers)
+        self.assertEqual(res.status_code, 200)
+        code = res.json()["code"]
+        host_id = res.json()["hostId"]
+        self.assertEqual(host_id, self.account_id)
+
+        # 2. Device 2 (iOS mobile) joins the room logged into the SAME account (self.headers)
+        #    but with a different guestId="device-ios"
+        poll_ios = self.client.get(
+            f"/party/{code}/poll?since=0&guest_id=device-ios",
+            headers=self.headers,
+        )
+        self.assertEqual(poll_ios.status_code, 200)
+        ios_data = poll_ios.json()
+        ios_participant_id = ios_data["yourAccountId"]
+        self.assertNotEqual(ios_participant_id, host_id)
+        self.assertEqual(len(ios_data["room"]["members"]), 2)
+
+        # 3. Either participant seeks backwards from 100s to 25s
+        seek_res = self.client.post(
+            f"/party/{code}/event?guest_id=device-ios",
+            json={"event": {"type": "SEEK", "time": 25.0}},
+            headers=self.headers,
+        )
+        self.assertEqual(seek_res.status_code, 200)
+        self.assertEqual(seek_res.json()["room"]["state"]["time"], 25.0)
+
+        # 4. An in-flight SYNC_TICK from Host arrives right after with stale time=104s;
+        #    it must be suppressed so the backward seek to 25.0s is not overwritten!
+        tick_res = self.client.post(
+            f"/party/{code}/event?guest_id=device-pc",
+            json={"event": {"type": "SYNC_TICK", "time": 104.0, "isPlaying": True}},
+            headers=self.headers,
+        )
+        self.assertEqual(tick_res.status_code, 200)
+        self.assertEqual(tick_res.json()["room"]["state"]["time"], 25.0)
+
 
 if __name__ == "__main__":
     unittest.main()
