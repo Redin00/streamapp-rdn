@@ -125,7 +125,7 @@ export function useWatchParty({
   const lastInitialSyncTsRef = useRef<number>(0);
   const handledEventKeysRef = useRef<Set<string>>(new Set());
 
-  const lastEventTsRef = useRef<number>(startingRoom?.createdAt ?? Date.now() - 5000);
+  const lastEventTsRef = useRef<number>(0);
 
   // Sync initialRoom when passed or updated from caller
   useEffect(() => {
@@ -338,11 +338,12 @@ export function useWatchParty({
     isDeadRoomRef.current = false;
     hasReceivedInitialRoomRef.current = false;
     lastInitialSyncTsRef.current = 0;
+    handledEventKeysRef.current.clear();
     wsConnectedRef.current = false;
     isPollingRef.current = false;
     setIsConnecting(true);
     setError(null);
-    lastEventTsRef.current = startingRoom?.createdAt ?? Date.now() - 5000;
+    lastEventTsRef.current = 0;
 
     const cleanCode = roomCode.trim().toUpperCase();
     const guestId = getOrCreateGuestId();
@@ -417,7 +418,7 @@ export function useWatchParty({
                     } else {
                       if (onRemotePauseRef.current) onRemotePauseRef.current(data.room.state.time);
                     }
-                  }, 1800);
+                  }, 400);
                 }
               }
 
@@ -449,6 +450,9 @@ export function useWatchParty({
                 }
                 handlePartyEvent(ev);
               }
+            }
+            if (roomLastUpdated > 0) {
+              lastEventTsRef.current = Math.max(lastEventTsRef.current, roomLastUpdated);
             }
           } else if (res.message) {
             pollErrorCount++;
@@ -691,7 +695,7 @@ export function useWatchParty({
                 } else {
                   if (onRemotePauseRef.current) onRemotePauseRef.current(msg.data.state.time);
                 }
-              }, 1800);
+              }, 400);
             }
           }
           break;
@@ -729,7 +733,7 @@ export function useWatchParty({
           const targetTime = Math.max(0, msg.time + elapsedSec);
           withRemoteSync(() => {
             if (onRemotePlayRef.current) onRemotePlayRef.current(targetTime, false);
-          }, 2000);
+          }, 400);
           setRoom((prev) =>
             prev ? { ...prev, state: { ...prev.state, isPlaying: true, time: targetTime, lastUpdated: Date.now() } } : null,
           );
@@ -749,7 +753,7 @@ export function useWatchParty({
           }
           withRemoteSync(() => {
             if (onRemotePauseRef.current) onRemotePauseRef.current(msg.time);
-          }, 2000);
+          }, 400);
           setRoom((prev) =>
             prev ? { ...prev, state: { ...prev.state, isPlaying: false, time: msg.time, lastUpdated: Date.now() } } : null,
           );
@@ -769,7 +773,7 @@ export function useWatchParty({
           }
           withRemoteSync(() => {
             if (onRemoteSeekRef.current) onRemoteSeekRef.current(msg.time);
-          }, 2000);
+          }, 400);
           setRoom((prev) =>
             prev ? { ...prev, state: { ...prev.state, time: msg.time, lastUpdated: Date.now() } } : null,
           );
@@ -888,17 +892,23 @@ export function useWatchParty({
   }, [roomCode, withRemoteSync, initialRoom]);
 
   // Host heartbeat / sync tick (broadcast every 4 seconds)
+  const roomCodeForHeartbeat = room?.code ?? null;
   useEffect(() => {
-    if (!isConnected || !isHost || !room) return;
+    if (!isConnected || !isHost || !roomCodeForHeartbeat) return;
 
     const interval = setInterval(() => {
-      const curTime = getCurrentTimeRef.current ? getCurrentTimeRef.current() : room.state.time;
-      const playing = getIsPlayingRef.current ? getIsPlayingRef.current() : room.state.isPlaying;
+      const currentRoom = roomRef.current;
+      const curTime = getCurrentTimeRef.current
+        ? getCurrentTimeRef.current()
+        : (currentRoom?.state.time ?? 0);
+      const playing = getIsPlayingRef.current
+        ? getIsPlayingRef.current()
+        : (currentRoom?.state.isPlaying ?? false);
       sendSyncTick(curTime, playing);
     }, 4000);
 
     return () => clearInterval(interval);
-  }, [isConnected, isHost, room, sendSyncTick]);
+  }, [isConnected, isHost, roomCodeForHeartbeat, sendSyncTick]);
 
   const leaveParty = useCallback(async () => {
     isDeadRoomRef.current = true;
