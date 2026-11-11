@@ -82,7 +82,7 @@ export function useWatchParty({
 
   const [room, setRoomState] = useState<WatchPartyRoom | null>(startingRoom);
   const [members, setMembers] = useState<PartyMember[]>(startingRoom?.members ?? []);
-  const [currentAccountId, setCurrentAccountId] = useState<number | null>(() => viewer?.id ?? null);
+  const [currentAccountId, setCurrentAccountId] = useState<number | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -123,6 +123,7 @@ export function useWatchParty({
 
   const lastSentRef = useRef<{ type: "PLAY" | "PAUSE" | "SEEK"; time: number; ts: number } | null>(null);
   const lastInitialSyncTsRef = useRef<number>(0);
+  const handledEventKeysRef = useRef<Set<string>>(new Set());
 
   const lastEventTsRef = useRef<number>(startingRoom?.createdAt ?? Date.now() - 5000);
 
@@ -278,20 +279,24 @@ export function useWatchParty({
 
   const sendChangeMedia = useCallback(
     (media: PartyMedia, time = 0) => {
-      setRoom((prev) =>
-        prev
-          ? {
-              ...prev,
-              media,
-              state: {
-                ...prev.state,
-                isPlaying: false,
-                time,
-                lastUpdated: Date.now(),
-              },
-            }
-          : null,
-      );
+      setRoom((prev) => {
+        if (!prev) return null;
+        const isDifferentMedia =
+          prev.media.slug !== media.slug ||
+          (media.type === "tv" &&
+            ((prev.media.season ?? 1) !== (media.season ?? 1) ||
+              (prev.media.episode ?? 1) !== (media.episode ?? 1)));
+        return {
+          ...prev,
+          media,
+          state: {
+            ...prev.state,
+            isPlaying: isDifferentMedia ? false : prev.state.isPlaying,
+            time,
+            lastUpdated: Date.now(),
+          },
+        };
+      });
       void sendEvent({ type: "CHANGE_MEDIA", media, time });
     },
     [sendEvent, setRoom],
@@ -379,18 +384,25 @@ export function useWatchParty({
 
             const data = res.data;
             if (data.yourAccountId !== undefined) {
-              setCurrentAccountId((prev) => prev ?? data.yourAccountId);
+              currentAccountIdRef.current = data.yourAccountId;
+              setCurrentAccountId(data.yourAccountId);
             }
+            let roomLastUpdated = 0;
+            let wasInitialPollLoad = false;
             if (data.room) {
               const isInitialRoomLoad = !hasReceivedInitialRoomRef.current;
+              wasInitialPollLoad = isInitialRoomLoad;
               hasReceivedInitialRoomRef.current = true;
+              roomLastUpdated = data.room.state?.lastUpdated ?? 0;
               setRoom(data.room);
               setMembers(data.room.members);
 
               // If member is not host, synchronize media and initial playback state
+              const effectiveId = data.yourAccountId ?? currentAccountIdRef.current;
               const isGuest =
-                data.yourAccountId !== undefined &&
-                data.room.hostId !== data.yourAccountId;
+                effectiveId !== null &&
+                effectiveId !== undefined &&
+                data.room.hostId !== effectiveId;
 
               if (isGuest) {
                 if (onRemoteMediaChangeRef.current) {
@@ -400,13 +412,12 @@ export function useWatchParty({
                 if (isInitialRoomLoad && now - lastInitialSyncTsRef.current > 4000) {
                   lastInitialSyncTsRef.current = now;
                   withRemoteSync(() => {
-                    if (onRemoteSeekRef.current) onRemoteSeekRef.current(data.room.state.time);
                     if (data.room.state.isPlaying) {
-                      if (onRemotePlayRef.current) onRemotePlayRef.current(data.room.state.time);
+                      if (onRemotePlayRef.current) onRemotePlayRef.current(data.room.state.time, false);
                     } else {
                       if (onRemotePauseRef.current) onRemotePauseRef.current(data.room.state.time);
                     }
-                  }, 1200);
+                  }, 1800);
                 }
               }
 
@@ -417,8 +428,24 @@ export function useWatchParty({
 
             if (Array.isArray(data.events) && data.events.length > 0) {
               for (const ev of data.events) {
-                if (ev && typeof ev === "object" && "timestamp" in ev && typeof ev.timestamp === "number") {
-                  lastEventTsRef.current = Math.max(lastEventTsRef.current, ev.timestamp);
+                const evTs =
+                  ev && typeof ev === "object" && "timestamp" in ev && typeof ev.timestamp === "number"
+                    ? ev.timestamp
+                    : 0;
+                if (evTs > 0) {
+                  lastEventTsRef.current = Math.max(lastEventTsRef.current, evTs);
+                }
+                // Initial poll already synchronized to data.room.state; skip stale playback events at/before state.lastUpdated
+                if (
+                  wasInitialPollLoad &&
+                  ev &&
+                  typeof ev === "object" &&
+                  "type" in ev &&
+                  (ev.type === "PLAY" || ev.type === "PAUSE" || ev.type === "SEEK" || ev.type === "CHANGE_MEDIA") &&
+                  evTs > 0 &&
+                  evTs <= roomLastUpdated
+                ) {
+                  continue;
                 }
                 handlePartyEvent(ev);
               }
@@ -610,11 +637,40 @@ export function useWatchParty({
     startHttpPolling();
 
     function handlePartyEvent(msg: PartyEvent) {
+      if (
+        msg.type === "PLAY" ||
+        msg.type === "PAUSE" ||
+        msg.type === "SEEK" ||
+        msg.type === "CHANGE_MEDIA" ||
+        msg.type === "SYNC_TICK"
+      ) {
+        const rawId = (msg as { id?: string }).id;
+        const evKey =
+          rawId ||
+          (typeof msg.timestamp === "number" && msg.timestamp > 0
+            ? `${msg.type}:${msg.timestamp}`
+            : null);
+        if (evKey) {
+          if (handledEventKeysRef.current.has(evKey)) {
+            return;
+          }
+          handledEventKeysRef.current.add(evKey);
+          if (handledEventKeysRef.current.size > 200) {
+            const first = handledEventKeysRef.current.values().next().value;
+            if (first) handledEventKeysRef.current.delete(first);
+          }
+        }
+      }
+
       switch (msg.type) {
         case "ROOM_STATE": {
+          currentAccountIdRef.current = msg.yourAccountId;
+          setCurrentAccountId(msg.yourAccountId);
           setRoom(msg.data);
           setMembers(msg.data.members);
-          setCurrentAccountId(msg.yourAccountId);
+          if (msg.data.state?.lastUpdated) {
+            lastEventTsRef.current = Math.max(lastEventTsRef.current, msg.data.state.lastUpdated);
+          }
           if (Array.isArray(msg.data.chatHistory)) {
             setChatMessages((prev) => mergeChatMessages(prev, msg.data.chatHistory as ChatMessage[]));
           }
@@ -630,13 +686,12 @@ export function useWatchParty({
             if (isInitialRoomLoad && now - lastInitialSyncTsRef.current > 4000) {
               lastInitialSyncTsRef.current = now;
               withRemoteSync(() => {
-                if (onRemoteSeekRef.current) onRemoteSeekRef.current(msg.data.state.time);
                 if (msg.data.state.isPlaying) {
-                  if (onRemotePlayRef.current) onRemotePlayRef.current(msg.data.state.time);
+                  if (onRemotePlayRef.current) onRemotePlayRef.current(msg.data.state.time, false);
                 } else {
                   if (onRemotePauseRef.current) onRemotePauseRef.current(msg.data.state.time);
                 }
-              }, 1200);
+              }, 1800);
             }
           }
           break;
@@ -655,10 +710,16 @@ export function useWatchParty({
           break;
         }
         case "PLAY": {
-          // Do not re-seek if this client was the sender or if we just sent PLAY locally
-          const isSender = "senderId" in msg && currentAccountIdRef.current && msg.senderId === currentAccountIdRef.current;
-          const isRecentLocalSend = lastSentRef.current?.type === "PLAY" && Date.now() - lastSentRef.current.ts < 3500;
-          if (isSender || isRecentLocalSend) {
+          // Do not re-seek if this client was the sender
+          const isSender =
+            "senderId" in msg &&
+            currentAccountIdRef.current !== null &&
+            msg.senderId === currentAccountIdRef.current;
+          const isFallbackSelf =
+            currentAccountIdRef.current === null &&
+            lastSentRef.current?.type === "PLAY" &&
+            Date.now() - lastSentRef.current.ts < 2000;
+          if (isSender || isFallbackSelf) {
             break;
           }
           const elapsedSec =
@@ -668,84 +729,97 @@ export function useWatchParty({
           const targetTime = Math.max(0, msg.time + elapsedSec);
           withRemoteSync(() => {
             if (onRemotePlayRef.current) onRemotePlayRef.current(targetTime, false);
-          }, 1600);
+          }, 2000);
           setRoom((prev) =>
             prev ? { ...prev, state: { ...prev.state, isPlaying: true, time: targetTime, lastUpdated: Date.now() } } : null,
           );
           break;
         }
         case "PAUSE": {
-          const isSender = "senderId" in msg && currentAccountIdRef.current && msg.senderId === currentAccountIdRef.current;
-          const isRecentLocalSend = lastSentRef.current?.type === "PAUSE" && Date.now() - lastSentRef.current.ts < 3500;
-          if (isSender || isRecentLocalSend) {
+          const isSender =
+            "senderId" in msg &&
+            currentAccountIdRef.current !== null &&
+            msg.senderId === currentAccountIdRef.current;
+          const isFallbackSelf =
+            currentAccountIdRef.current === null &&
+            lastSentRef.current?.type === "PAUSE" &&
+            Date.now() - lastSentRef.current.ts < 2000;
+          if (isSender || isFallbackSelf) {
             break;
           }
           withRemoteSync(() => {
             if (onRemotePauseRef.current) onRemotePauseRef.current(msg.time);
-          }, 1600);
+          }, 2000);
           setRoom((prev) =>
             prev ? { ...prev, state: { ...prev.state, isPlaying: false, time: msg.time, lastUpdated: Date.now() } } : null,
           );
           break;
         }
         case "SEEK": {
-          const isSender = "senderId" in msg && currentAccountIdRef.current && msg.senderId === currentAccountIdRef.current;
-          const isRecentLocalSend = lastSentRef.current?.type === "SEEK" && Date.now() - lastSentRef.current.ts < 3500;
-          if (isSender || isRecentLocalSend) {
+          const isSender =
+            "senderId" in msg &&
+            currentAccountIdRef.current !== null &&
+            msg.senderId === currentAccountIdRef.current;
+          const isFallbackSelf =
+            currentAccountIdRef.current === null &&
+            lastSentRef.current?.type === "SEEK" &&
+            Date.now() - lastSentRef.current.ts < 2000;
+          if (isSender || isFallbackSelf) {
             break;
           }
           withRemoteSync(() => {
             if (onRemoteSeekRef.current) onRemoteSeekRef.current(msg.time);
-          }, 1800);
+          }, 2000);
           setRoom((prev) =>
             prev ? { ...prev, state: { ...prev.state, time: msg.time, lastUpdated: Date.now() } } : null,
           );
           break;
         }
         case "SYNC_TICK": {
-          const currentRoom = roomRef.current;
           // Ignore SYNC_TICK if this participant just initiated a local PLAY/PAUSE/SEEK within 5s
           if (lastSentRef.current && Date.now() - lastSentRef.current.ts < 5000) {
             break;
           }
-          if (currentRoom && currentAccountIdRef.current !== currentRoom.hostId && getCurrentTimeRef.current) {
-            const elapsedSec =
-              msg.isPlaying && typeof msg.timestamp === "number" && msg.timestamp > 0
-                ? Math.max(0, Math.min(2.5, (Date.now() - msg.timestamp) / 1000))
-                : 0;
-            const targetTime = Math.max(0, msg.time + elapsedSec);
-            const current = getCurrentTimeRef.current();
-            const diff = Math.abs(current - targetTime);
-            const isLocalCurrentlyPlaying = getIsPlayingRef.current ? getIsPlayingRef.current() : false;
-            const playStateMismatch = isLocalCurrentlyPlaying !== msg.isPlaying;
-
-            if (playStateMismatch || diff > 3.0) {
-              withRemoteSync(() => {
-                if (msg.isPlaying) {
-                  if (onRemotePlayRef.current) onRemotePlayRef.current(targetTime, true);
-                } else {
-                  if (diff > 3.0 && onRemoteSeekRef.current) {
-                    onRemoteSeekRef.current(msg.time);
-                  }
-                  if (onRemotePauseRef.current) {
-                    onRemotePauseRef.current(msg.time);
-                  }
+          // Update room state timestamp for UI and newly joining actions without reloading active iframe players
+          setRoom((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  state: {
+                    ...prev.state,
+                    time: msg.time,
+                    isPlaying: msg.isPlaying,
+                    lastUpdated: Date.now(),
+                  },
                 }
-              }, 1600);
-            }
-          }
+              : null,
+          );
           break;
         }
         case "CHANGE_MEDIA": {
-          if ("senderId" in msg && currentAccountIdRef.current && msg.senderId === currentAccountIdRef.current) {
+          if ("senderId" in msg && currentAccountIdRef.current !== null && msg.senderId === currentAccountIdRef.current) {
             break;
           }
           if (onRemoteMediaChangeRef.current) {
             onRemoteMediaChangeRef.current(msg.media, roomCode || undefined);
           }
-          setRoom((prev) =>
-            prev ? { ...prev, media: msg.media, state: { isPlaying: false, time: msg.time, lastUpdated: Date.now() } } : null,
-          );
+          setRoom((prev) => {
+            if (!prev) return null;
+            const isDifferentMedia =
+              prev.media.slug !== msg.media.slug ||
+              (msg.media.type === "tv" &&
+                ((prev.media.season ?? 1) !== (msg.media.season ?? 1) ||
+                  (prev.media.episode ?? 1) !== (msg.media.episode ?? 1)));
+            return {
+              ...prev,
+              media: msg.media,
+              state: {
+                isPlaying: isDifferentMedia ? false : prev.state.isPlaying,
+                time: msg.time,
+                lastUpdated: Date.now(),
+              },
+            };
+          });
           break;
         }
         case "CHAT": {

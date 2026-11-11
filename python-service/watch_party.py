@@ -231,6 +231,7 @@ class MediaPayload(BaseModel):
 class CreatePartyRequest(BaseModel):
     media: MediaPayload
     initialTime: float = Field(default=0.0, ge=0.0)
+    isPlaying: bool = Field(default=False)
     guestId: Optional[str] = None
     guestName: Optional[str] = None
     guestColor: Optional[str] = None
@@ -266,7 +267,14 @@ class PartyRoomState(BaseModel):
 # --------------------------------------------------------------------------- #
 
 class PartyRoom:
-    def __init__(self, code: str, media: MediaPayload, host_account: Dict[str, Any], initial_time: float = 0.0):
+    def __init__(
+        self,
+        code: str,
+        media: MediaPayload,
+        host_account: Dict[str, Any],
+        initial_time: float = 0.0,
+        is_playing: bool = False,
+    ):
         self.code = code
         self.media = media
         self.host_id = host_account["id"]
@@ -274,7 +282,7 @@ class PartyRoom:
         self.last_activity: float = time.time()
         self.state = PartyPlaybackState(
             time=initial_time,
-            isPlaying=False,
+            isPlaying=is_playing,
             lastUpdated=self.created_at,
         )
         self.members: Dict[int, Dict[str, Any]] = {
@@ -352,6 +360,12 @@ class PartyRoom:
         return is_new
 
     def get_room_state_dict(self) -> Dict[str, Any]:
+        state_dump = self.state.model_dump()
+        if self.state.isPlaying and self.state.lastUpdated > 0:
+            elapsed = (time.time() * 1000 - self.state.lastUpdated) / 1000.0
+            if elapsed >= 0.5:
+                state_dump["time"] = round(self.state.time + min(10.0, elapsed), 2)
+
         return {
             "code": self.code,
             "media": self.media.model_dump(),
@@ -366,7 +380,7 @@ class PartyRoom:
                 }
                 for m in self.members.values()
             ],
-            "state": self.state.model_dump(),
+            "state": state_dump,
             "chatHistory": list(self.chat_history),
             "createdAt": self.created_at,
         }
@@ -397,7 +411,13 @@ class PartyManager:
         self.rooms: Dict[str, PartyRoom] = {}
         self._lock = asyncio.Lock()
 
-    async def create_room(self, media: MediaPayload, host_account: Dict[str, Any], initial_time: float = 0.0) -> PartyRoom:
+    async def create_room(
+        self,
+        media: MediaPayload,
+        host_account: Dict[str, Any],
+        initial_time: float = 0.0,
+        is_playing: bool = False,
+    ) -> PartyRoom:
         async with self._lock:
             if len(self.rooms) >= MAX_ACTIVE_ROOMS:
                 # Evict stale rooms without active connections
@@ -419,7 +439,7 @@ class PartyManager:
                 code = f"ROOM-{int(time.time()) % 10000}"
 
             clean_code = code.upper().strip()
-            room = PartyRoom(clean_code, media, host_account, initial_time)
+            room = PartyRoom(clean_code, media, host_account, initial_time, is_playing)
             self.rooms[clean_code] = room
             log.info("Watch party created: %s by user %s (%s)", clean_code, host_account["name"], media.titleName)
             return room
@@ -553,7 +573,8 @@ async def apply_room_event(
                 async with room.lock:
                     room.media = new_media
                     room.state.time = time_val
-                    room.state.isPlaying = False
+                    if is_different_media:
+                        room.state.isPlaying = False
                     room.state.lastUpdated = int(time.time() * 1000)
                     room.last_explicit_event_at = time.time()
                 event = {
@@ -631,7 +652,7 @@ async def create_party_endpoint(
         guest_color=body.guestColor,
         guest_avatar=body.guestAvatar,
     )
-    room = await party_manager.create_room(body.media, account, body.initialTime)
+    room = await party_manager.create_room(body.media, account, body.initialTime, body.isPlaying)
     return room.get_room_state_dict()
 
 

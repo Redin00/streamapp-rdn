@@ -18,6 +18,7 @@ const mediaSchema = z.object({
 const createPartySchema = z.object({
   media: mediaSchema,
   initialTime: z.number().default(0),
+  isPlaying: z.boolean().default(false),
   guestId: z.string().max(64).optional(),
   guestName: z.string().max(40).optional(),
   guestColor: z.string().max(16).optional(),
@@ -53,6 +54,7 @@ export const createPartyRoom = createServerFn({ method: "POST" })
   .validator((data: {
     media: PartyMedia;
     initialTime?: number | undefined;
+    isPlaying?: boolean | undefined;
     guestId?: string | undefined;
     guestName?: string | undefined;
     guestColor?: string | undefined;

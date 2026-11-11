@@ -406,6 +406,31 @@ class TestWatchParty(unittest.TestCase):
         self.assertEqual(tick_res.status_code, 200)
         self.assertEqual(tick_res.json()["room"]["state"]["time"], 25.0)
 
+    def test_create_playing_party_and_elapsed_time_projection(self):
+        payload = {
+            "media": {
+                "slug": "playing-create-test",
+                "tmdbId": 555,
+                "type": "movie",
+                "titleName": "Already Playing Movie",
+            },
+            "initialTime": 120.0,
+            "isPlaying": True,
+        }
+        res = self.client.post("/party/create", json=payload, headers=self.headers)
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        code = data["code"]
+        self.assertTrue(data["state"]["isPlaying"])
+        self.assertGreaterEqual(data["state"]["time"], 120.0)
+
+        # Wait > 0.5s and verify newly fetching guest gets projected live timestamp
+        time.sleep(0.6)
+        get_res = self.client.get(f"/party/{code}")
+        self.assertEqual(get_res.status_code, 200)
+        projected_time = get_res.json()["state"]["time"]
+        self.assertGreater(projected_time, 120.3)
+
 
 if __name__ == "__main__":
     unittest.main()

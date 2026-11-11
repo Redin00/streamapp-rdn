@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, createFileRoute, notFound } from "@tanstack/react-router";
 import { queryOptions, useQuery, useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
-import { ArrowLeft, CheckCircle2, ChevronDown, FastForward, Languages, Loader2, Maximize, Minimize, Pause, Play, Rewind, RotateCcw, Users } from "lucide-react";
+import { ArrowLeft, CheckCircle2, ChevronDown, Languages, Loader2, Maximize, Minimize, Pause, Play, RotateCcw, Users } from "lucide-react";
 import { z } from "zod";
 
 import { HlsPlayer, type HlsPlayerHandle } from "@/components/HlsPlayer";
@@ -165,6 +165,16 @@ function WatchPage() {
   const [selectedLang, setSelectedLang] = useState<string>(siteLang);
   const partyLangRef = useRef<string>(siteLang);
 
+  const embedUrl = title?.tmdbId
+    ? buildEmbedUrl(player, {
+        tmdbId: title.tmdbId,
+        type: title.type,
+        season: activeSeason?.number,
+        episode: activeEpisode?.number,
+        lang: selectedLang,
+      })
+    : null;
+
   const streamQuery = useQuery({
     queryKey: ["stream", title?.tmdbId, title?.type, activeSeason?.number, activeEpisode?.number, selectedLang],
     queryFn: () => {
@@ -179,21 +189,12 @@ function WatchPage() {
         },
       });
     },
-    enabled: Boolean(title?.tmdbId),
+    enabled: Boolean(title?.tmdbId && !embedUrl),
     retry: false,
     staleTime: 5 * 60 * 1000,
   });
 
-  const playlistUrl = streamQuery.data?.playlistUrl ?? null;
-  const embedUrl = title?.tmdbId
-    ? buildEmbedUrl(player, {
-        tmdbId: title.tmdbId,
-        type: title.type,
-        season: activeSeason?.number,
-        episode: activeEpisode?.number,
-        lang: selectedLang,
-      })
-    : null;
+  const playlistUrl = !embedUrl ? (streamQuery.data?.playlistUrl ?? null) : null;
 
   // --- resume position ---
 
@@ -233,15 +234,22 @@ function WatchPage() {
   const isLocalPlayingRef = useRef(isLocalPlaying);
   const isRoomPausedRef = useRef(false);
   const [isPausedByRemote, setIsPausedByRemote] = useState(false);
+  const isPausedByRemoteRef = useRef(false);
   const [isEnded, setIsEnded] = useState(false);
   const isEndedRef = useRef(false);
-  const iframeHasPlayedRef = useRef(false);
   const remoteSeekDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const localSeekDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const localPlayDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pauseDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastLocalSeekBroadcastRef = useRef<number>(0);
+  const pendingSeekEventAtRef = useRef<number>(0);
+  const lastSeekActivityAtRef = useRef<number>(0);
+  const lastKnownDurationRef = useRef<number>(0);
   useEffect(() => {
     isLocalPlayingRef.current = isLocalPlaying;
   }, [isLocalPlaying]);
+  useEffect(() => {
+    isPausedByRemoteRef.current = isPausedByRemote;
+  }, [isPausedByRemote]);
 
   const [vixsrcEmbedUrl, setVixsrcEmbedUrl] = useState<string | null>(null);
   // Incremented to force the iframe to fully remount when remote sync requires a reload
@@ -393,47 +401,96 @@ function WatchPage() {
   const remoteActionRef = useRef<{ type: string | null; ts: number }>({ type: null, ts: 0 });
   const lastRemoteReloadRef = useRef<number>(0);
 
-  // Tracks startup events expected from newly mounted Vixsrc iframe
-  const pendingIframeStartupRef = useRef<{
+  // Tracks startup state of the currently mounted Vixsrc iframe so startup play/seek/pause
+  // events (even after a 3-6s 2-stage load or browser autoplay block) never trigger echo loops
+  const iframeStartupRef = useRef<{
     key: number;
-    createdAt: number;
-    expectedSeekTime?: number | undefined;
-    expectedAutoplay?: boolean | undefined;
-  }>({ key: 0, createdAt: 0 });
+    mountedAt: number;
+    targetTime: number;
+    expectedAutoplay: boolean;
+    hasStartedPlaying: boolean;
+    playingSince: number;
+  }>({
+    key: 0,
+    mountedAt: 0,
+    targetTime: 0,
+    expectedAutoplay: false,
+    hasStartedPlaying: false,
+    playingSince: 0,
+  });
+
+  const lastReloadMetaRef = useRef<{
+    mediaKey: string;
+    targetTime: number;
+    autoplay: boolean;
+    lang: string;
+    ts: number;
+  } | null>(null);
 
   // Helper to safely re-generate the iframe embed URL and remount the iframe for Vixsrc
   const reloadVixsrc = useCallback(
     (startAt?: number, autoplay?: boolean, forcedLang?: string) => {
       if (!title?.tmdbId || !player) return;
-      const targetTime =
+      const numericStart =
         typeof startAt === "number" && Number.isFinite(startAt) && startAt >= 0
           ? Math.floor(startAt)
           : undefined;
+      // In Vixsrc (vixsrc-1BuQSlV5.js), on("ready") runs:
+      //   const e = a.get("startAt"); e ? n.seek(parseInt(e)) : n.play(!1);
+      // If startAt is omitted, Vixsrc calls n.play(false) which pauses the player.
+      // Passing startAt >= 1 when autoplay=true forces Vixsrc to seek and play.
+      const effectiveStartAt =
+        autoplay === true
+          ? Math.max(1, numericStart ?? 1)
+          : numericStart;
       const langToUse = forcedLang || selectedLang || (locale === "en" ? "en" : "it");
+      const mediaKey = `${title.tmdbId}:${activeSeason?.number ?? 0}:${activeEpisode?.number ?? 0}`;
+      const now = Date.now();
+
+      // Deduplicate rapid identical reloads (e.g. initial room load + poll arriving 100ms apart)
+      const prevMeta = lastReloadMetaRef.current;
+      if (
+        prevMeta &&
+        prevMeta.mediaKey === mediaKey &&
+        prevMeta.lang === langToUse &&
+        prevMeta.autoplay === Boolean(autoplay) &&
+        Math.abs(prevMeta.targetTime - (numericStart ?? 0)) <= 2 &&
+        now - prevMeta.ts < 2200
+      ) {
+        return;
+      }
+
       const nextUrl = buildEmbedUrl(player, {
         tmdbId: title.tmdbId,
         type: title.type,
         season: activeSeason?.number,
         episode: activeEpisode?.number,
-        startAt: targetTime,
+        startAt: effectiveStartAt,
         autoplay,
         lang: langToUse,
       });
       if (nextUrl) {
-        const now = Date.now();
         lastRemoteReloadRef.current = now;
-        iframeHasPlayedRef.current = false;
-        if (targetTime !== undefined) {
-          latestSecondsRef.current = targetTime;
+        lastReloadMetaRef.current = {
+          mediaKey,
+          targetTime: numericStart ?? 0,
+          autoplay: Boolean(autoplay),
+          lang: langToUse,
+          ts: now,
+        };
+        if (numericStart !== undefined) {
+          latestSecondsRef.current = numericStart;
         }
         setVixsrcEmbedUrl(nextUrl);
         setVixsrcIframeKey((k) => {
           const nextKey = k + 1;
-          pendingIframeStartupRef.current = {
+          iframeStartupRef.current = {
             key: nextKey,
-            createdAt: now,
-            expectedSeekTime: targetTime,
-            expectedAutoplay: autoplay,
+            mountedAt: now,
+            targetTime: numericStart ?? 0,
+            expectedAutoplay: Boolean(autoplay),
+            hasStartedPlaying: false,
+            playingSince: 0,
           };
           return nextKey;
         });
@@ -471,14 +528,24 @@ function WatchPage() {
   }, [partyCode]);
 
   const onRemotePlay = useCallback(
-    (time: number, isSyncTick = false) => {
+    (time: number, _isSyncTick = false) => {
       if (pauseDebounceRef.current) {
         clearTimeout(pauseDebounceRef.current);
         pauseDebounceRef.current = null;
       }
-      const wasPaused = isRoomPausedRef.current || !isLocalPlayingRef.current;
+      if (localSeekDebounceRef.current) {
+        clearTimeout(localSeekDebounceRef.current);
+        localSeekDebounceRef.current = null;
+      }
+      if (localPlayDebounceRef.current) {
+        clearTimeout(localPlayDebounceRef.current);
+        localPlayDebounceRef.current = null;
+      }
+      const wasPaused =
+        isRoomPausedRef.current || isPausedByRemoteRef.current || !isLocalPlayingRef.current;
       isRoomPausedRef.current = false;
       setIsPausedByRemote(false);
+      isPausedByRemoteRef.current = false;
       setIsEnded(false);
       isEndedRef.current = false;
       if (playlistUrl && !hlsFailed) {
@@ -498,23 +565,11 @@ function WatchPage() {
         remoteActionRef.current = { type: "play", ts: Date.now() };
         latestSecondsRef.current = time;
 
-        if (isSyncTick) {
-          // On periodic SYNC_TICK in iframe mode, do NOT reload the iframe unless we were
-          // paused or severely desynced (> 12s) after playback has already started.
-          // This prevents iOS/mobile iframes waiting for user tap from reloading every 4s.
-          if (
-            wasPaused ||
-            (iframeHasPlayedRef.current &&
-              Math.abs(cur - time) > 12 &&
-              Date.now() - lastRemoteReloadRef.current >= 10000)
-          ) {
-            reloadVixsrc(time, true);
-          }
-        } else {
-          // Explicit remote PLAY event: reload if we were paused or drifted by > 2.5s
-          if (wasPaused || Math.abs(cur - time) > 2.5) {
-            reloadVixsrc(time, true);
-          }
+        if (wasPaused) {
+          lastReloadMetaRef.current = null;
+          reloadVixsrc(time, true);
+        } else if (Math.abs(cur - time) > 3.0) {
+          reloadVixsrc(time, true);
         }
       }
     },
@@ -531,8 +586,19 @@ function WatchPage() {
         clearTimeout(remoteSeekDebounceRef.current);
         remoteSeekDebounceRef.current = null;
       }
+      if (localSeekDebounceRef.current) {
+        clearTimeout(localSeekDebounceRef.current);
+        localSeekDebounceRef.current = null;
+      }
+      if (localPlayDebounceRef.current) {
+        clearTimeout(localPlayDebounceRef.current);
+        localPlayDebounceRef.current = null;
+      }
+      pendingSeekEventAtRef.current = 0;
+      lastReloadMetaRef.current = null;
       isRoomPausedRef.current = true;
       setIsPausedByRemote(true);
+      isPausedByRemoteRef.current = true;
       setIsLocalPlaying(false);
       isLocalPlayingRef.current = false;
       latestSecondsRef.current = time;
@@ -555,6 +621,15 @@ function WatchPage() {
         clearTimeout(pauseDebounceRef.current);
         pauseDebounceRef.current = null;
       }
+      if (localSeekDebounceRef.current) {
+        clearTimeout(localSeekDebounceRef.current);
+        localSeekDebounceRef.current = null;
+      }
+      if (localPlayDebounceRef.current) {
+        clearTimeout(localPlayDebounceRef.current);
+        localPlayDebounceRef.current = null;
+      }
+      pendingSeekEventAtRef.current = 0;
       latestSecondsRef.current = time;
       setIsEnded(false);
       isEndedRef.current = false;
@@ -562,14 +637,15 @@ function WatchPage() {
       if (playlistUrl && !hlsFailed) {
         hlsPlayerRef.current?.seek(time);
       } else {
-        // Debounce iframe reload by 200ms so rapid backward/forward seeks never get dropped
         if (remoteSeekDebounceRef.current) {
           clearTimeout(remoteSeekDebounceRef.current);
         }
         remoteSeekDebounceRef.current = setTimeout(() => {
           remoteSeekDebounceRef.current = null;
-          reloadVixsrc(time, !isRoomPausedRef.current);
-        }, 200);
+          if (!isPausedByRemoteRef.current) {
+            reloadVixsrc(time, !isRoomPausedRef.current);
+          }
+        }, 180);
       }
     },
     [playlistUrl, hlsFailed, reloadVixsrc],
@@ -676,6 +752,23 @@ function WatchPage() {
     if (activeMediaKeyRef.current !== currentMediaKey) {
       activeMediaKeyRef.current = currentMediaKey;
       latestSecondsRef.current = 0;
+      lastKnownDurationRef.current = 0;
+      lastReloadMetaRef.current = null;
+      lastRemoteReloadRef.current = 0;
+      pendingSeekEventAtRef.current = 0;
+      lastSeekActivityAtRef.current = 0;
+      if (pauseDebounceRef.current) {
+        clearTimeout(pauseDebounceRef.current);
+        pauseDebounceRef.current = null;
+      }
+      if (localSeekDebounceRef.current) {
+        clearTimeout(localSeekDebounceRef.current);
+        localSeekDebounceRef.current = null;
+      }
+      if (localPlayDebounceRef.current) {
+        clearTimeout(localPlayDebounceRef.current);
+        localPlayDebounceRef.current = null;
+      }
       setIsEnded(false);
       isEndedRef.current = false;
     }
@@ -771,6 +864,12 @@ function WatchPage() {
       latestSecondsRef.current = 0;
       setIsEnded(false);
       isEndedRef.current = false;
+      isRoomPausedRef.current = true;
+      setIsPausedByRemote(true);
+      isPausedByRemoteRef.current = true;
+      setIsLocalPlaying(false);
+      isLocalPlayingRef.current = false;
+      lastReloadMetaRef.current = null;
     }
 
     party.sendChangeMedia(
@@ -808,6 +907,7 @@ function WatchPage() {
         );
       }
 
+      lastReloadMetaRef.current = null;
       reloadVixsrc(curTime > 0 ? curTime : undefined, isLocalPlaying, newLang);
     },
     [party.room, party.sendChangeMedia, title, slug, activeSeason?.number, activeEpisode?.number, reloadVixsrc, isLocalPlaying],
@@ -848,6 +948,7 @@ function WatchPage() {
             lang: selectedLang,
           },
           initialTime,
+          isPlaying: isLocalPlayingRef.current,
           guestId,
           guestName: viewer?.name,
           guestColor: viewer?.color,
@@ -863,6 +964,9 @@ function WatchPage() {
       // Immediately set the room so UI transitions to the active room view without delay
       party.setRoom(res.room);
       party.setCurrentAccountId(res.room.hostId);
+      isRoomPausedRef.current = !res.room.state.isPlaying;
+      setIsPausedByRemote(false);
+      isPausedByRemoteRef.current = false;
       const cleanCode = res.room.code.trim().toUpperCase();
       setPartyCode(cleanCode);
       try {
@@ -909,16 +1013,6 @@ function WatchPage() {
         setSelectedLang(res.room.media.lang);
         partyLangRef.current = res.room.media.lang;
       }
-      if (res.room.state?.time && res.room.state.time > 0) {
-        latestSecondsRef.current = res.room.state.time;
-        if (res.room.state.isPlaying && !playlistUrl) {
-          setIsPausedByRemote(false);
-          isRoomPausedRef.current = false;
-          setIsLocalPlaying(true);
-          isLocalPlayingRef.current = true;
-          reloadVixsrc(res.room.state.time, true, res.room.media?.lang || undefined);
-        }
-      }
       const targetMedia = res.room.media;
       if (targetMedia && targetMedia.slug) {
         const isDiffSlug = targetMedia.slug !== slug;
@@ -940,6 +1034,24 @@ function WatchPage() {
             },
           });
           return;
+        }
+      }
+      if (res.room.state) {
+        const roomTime = Math.max(0, res.room.state.time || 0);
+        latestSecondsRef.current = roomTime;
+        if (res.room.state.isPlaying) {
+          isRoomPausedRef.current = false;
+          setIsPausedByRemote(false);
+          isPausedByRemoteRef.current = false;
+          setIsLocalPlaying(true);
+          isLocalPlayingRef.current = true;
+          reloadVixsrc(roomTime, true, res.room.media?.lang || undefined);
+        } else {
+          isRoomPausedRef.current = true;
+          setIsPausedByRemote(true);
+          isPausedByRemoteRef.current = true;
+          setIsLocalPlaying(false);
+          isLocalPlayingRef.current = false;
         }
       }
     } catch (err) {
@@ -993,12 +1105,20 @@ function WatchPage() {
           ? party.room.state.time
           : undefined)
       : (marker ?? undefined);
-    const initialAutoplay = party.room ? party.room.state.isPlaying : undefined;
+    const effectiveRoomPlaying = party.room ? Boolean(isRoomMatchingMedia && party.room.state.isPlaying) : false;
+    const initialAutoplay = party.room ? effectiveRoomPlaying : undefined;
     if (party.room) {
-      setIsLocalPlaying(party.room.state.isPlaying);
-      isLocalPlayingRef.current = party.room.state.isPlaying;
-      isRoomPausedRef.current = !party.room.state.isPlaying;
-      setIsPausedByRemote(!party.room.state.isPlaying);
+      setIsLocalPlaying(effectiveRoomPlaying);
+      isLocalPlayingRef.current = effectiveRoomPlaying;
+      isRoomPausedRef.current = !effectiveRoomPlaying;
+      setIsPausedByRemote(!effectiveRoomPlaying);
+      isPausedByRemoteRef.current = !effectiveRoomPlaying;
+      if (initialStart !== undefined) {
+        latestSecondsRef.current = initialStart;
+      }
+      if (!effectiveRoomPlaying) {
+        lastReloadMetaRef.current = null;
+      }
     }
     reloadVixsrc(initialStart, initialAutoplay);
   }, [
@@ -1095,18 +1215,35 @@ function WatchPage() {
     };
   }, [slug, title, season, episode]);
 
+  function saveCompletedMarkerToStorage() {
+    clearCompletedMarker();
+    if (!title) return;
+    if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
+    saveDebounceRef.current = null;
+    void updateWatchMarker({
+      data: { slug, title, season, episode, marker: 0 },
+    });
+    try {
+      const key = `watch-marker:${slug}:${season}:${episode}`;
+      localStorage.setItem(key, "0");
+    } catch {
+      // Ignore quota/storage errors — the server write is the source of truth.
+    }
+  }
+
   function persistMarker(seconds: number, immediate = false) {
     if (!markerLoaded) return;
-    if (playbackDurationSeconds > 0 && seconds >= playbackDurationSeconds) {
-      clearCompletedMarker();
-      seconds = 0;
-    }
     latestSecondsRef.current = seconds;
+    const isCompleted = playbackDurationSeconds > 0 && seconds >= playbackDurationSeconds;
+    const markerValue = isCompleted ? 0 : seconds;
+    if (isCompleted) {
+      clearCompletedMarker();
+    }
     if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
     const save = () => {
       saveDebounceRef.current = null;
       if (!title) return;
-      const clamped = Math.max(0, Math.round(seconds));
+      const clamped = Math.max(0, Math.round(markerValue));
       void updateWatchMarker({
         data: { slug, title, season, episode, marker: clamped },
       });
@@ -1153,199 +1290,59 @@ function WatchPage() {
   useEffect(() => {
     if (!markerLoaded) return;
 
-    const handlePlayerMessage = (event: MessageEvent) => {
-      // Ignore self-dispatched messages; allow nested player iframes inside the embed provider
-      if (event.source === window) return;
-
-      let data = event.data;
-      if (!data) return;
-
-      // Ignore React DevTools / webpack / unrelated messages
-      if (
-        typeof data === "object" &&
-        "source" in data &&
-        typeof (data as Record<string, unknown>)["source"] === "string" &&
-        String((data as Record<string, unknown>)["source"]).startsWith("react-devtools")
-      ) {
-        return;
+    const toValidSeconds = (v: unknown): number | null => {
+      if (typeof v === "number" && Number.isFinite(v) && v >= 0) return v;
+      if (typeof v === "string") {
+        const p = parseFloat(v);
+        if (Number.isFinite(p) && p >= 0) return p;
       }
+      return null;
+    };
 
-      const isStartupWindow = Date.now() - pendingIframeStartupRef.current.createdAt < 3500;
-
-      const scheduleDebouncedPause = (curSec: number) => {
-        if (pauseDebounceRef.current) {
-          clearTimeout(pauseDebounceRef.current);
-        }
-        pauseDebounceRef.current = setTimeout(() => {
-          pauseDebounceRef.current = null;
-          // If a seek or play happened while debouncing, do not treat as pause
-          if (Date.now() - lastLocalSeekBroadcastRef.current < 1000) {
-            return;
-          }
-          isRoomPausedRef.current = true;
-          // Keep iframe mounted on local pause so user can still scrub timeline or press play inside iframe
-          setIsLocalPlaying(false);
-          isLocalPlayingRef.current = false;
-          const targetSec = latestSecondsRef.current ?? curSec;
-          if (Number.isFinite(targetSec) && targetSec >= 0) {
-            persistMarker(targetSec, true);
-          }
-          const suppressBroadcast =
-            party.isRemoteSyncingRef.current ||
-            Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS ||
-            (remoteActionRef.current.type === "pause" &&
-              Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS);
-          if (!suppressBroadcast && party.room && Number.isFinite(targetSec)) {
-            party.sendPause(targetSec);
-          }
-        }, 350);
-      };
-
-      // Handle string messages
+    const parsePlayerMessage = (
+      rawData: unknown,
+    ): { eventName: string; seconds: number | null; totalDuration: number | null } | null => {
+      let data = rawData;
       if (typeof data === "string") {
         const trimmed = data.trim();
         if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
           try {
             data = JSON.parse(trimmed);
           } catch {
-            return;
+            return null;
           }
         } else {
           const lower = trimmed.toLowerCase();
-          if (lower === "pause") {
-            const curSec = latestSecondsRef.current ?? 0;
-            const isNearEnd =
-              isEndedRef.current ||
-              (playbackDurationSeconds > 0 && curSec >= playbackDurationSeconds - 3);
-            if (isNearEnd) {
-              setIsEnded(true);
-              isEndedRef.current = true;
-              setIsLocalPlaying(false);
-              isLocalPlayingRef.current = false;
-              clearCompletedMarker();
-              persistMarker(0, true);
-              return;
-            }
-
-            const isStartupPause =
-              isStartupWindow &&
-              pendingIframeStartupRef.current.key === vixsrcIframeKey &&
-              pendingIframeStartupRef.current.expectedAutoplay === false;
-            if (isStartupPause) {
-              pendingIframeStartupRef.current.expectedAutoplay = undefined;
-              return;
-            }
-            scheduleDebouncedPause(curSec);
-            return;
-          }
-          if (lower === "play" || lower === "playing" || lower === "start") {
-            if (pauseDebounceRef.current) {
-              clearTimeout(pauseDebounceRef.current);
-              pauseDebounceRef.current = null;
-            }
-            iframeHasPlayedRef.current = true;
-            setIsEnded(false);
-            isEndedRef.current = false;
-            isRoomPausedRef.current = false;
-            setIsPausedByRemote(false);
-            setIsLocalPlaying(true);
-            isLocalPlayingRef.current = true;
-
-            const isStartupPlay =
-              isStartupWindow &&
-              pendingIframeStartupRef.current.key === vixsrcIframeKey &&
-              pendingIframeStartupRef.current.expectedAutoplay === true;
-            if (isStartupPlay) {
-              pendingIframeStartupRef.current.expectedAutoplay = undefined;
-              return;
-            }
-            const isSuppressed =
-              party.isRemoteSyncingRef.current ||
-              Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS ||
-              (remoteActionRef.current.type === "play" &&
-                Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS);
-            if (isSuppressed) {
-              return;
-            }
-            const curSec = latestSecondsRef.current ?? 0;
-            if (party.room) {
-              party.sendPlay(curSec);
-            }
-            return;
-          }
-          if (lower === "seeking" || lower === "seek" || lower === "seeked") {
-            if (pauseDebounceRef.current) {
-              clearTimeout(pauseDebounceRef.current);
-              pauseDebounceRef.current = null;
-            }
-            setIsEnded(false);
-            isEndedRef.current = false;
-            const curSec = latestSecondsRef.current ?? 0;
-            persistMarker(curSec, true);
-            const isStartupSeek =
-              isStartupWindow &&
-              pendingIframeStartupRef.current.key === vixsrcIframeKey &&
-              pendingIframeStartupRef.current.expectedSeekTime !== undefined;
-            if (isStartupSeek) {
-              pendingIframeStartupRef.current.expectedSeekTime = undefined;
-              return;
-            }
-            const suppressBroadcast =
-              party.isRemoteSyncingRef.current ||
-              Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS ||
-              (remoteActionRef.current.type === "seek" && Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS);
-            if (!suppressBroadcast && party.room) {
-              lastLocalSeekBroadcastRef.current = Date.now();
-              party.sendSeek(curSec);
-            }
-            return;
-          }
-          if (lower === "ended" || lower === "finish" || lower === "complete") {
-            if (pauseDebounceRef.current) {
-              clearTimeout(pauseDebounceRef.current);
-              pauseDebounceRef.current = null;
-            }
-            setIsEnded(true);
-            isEndedRef.current = true;
-            setIsLocalPlaying(false);
-            isLocalPlayingRef.current = false;
-            clearCompletedMarker();
-            persistMarker(0, true);
-            return;
-          }
           if (lower.startsWith("time:")) {
             const parsed = parseFloat(lower.slice(5));
-            if (
-              Number.isFinite(parsed) &&
-              parsed >= 0 &&
-              Date.now() - lastRemoteReloadRef.current >= REMOTE_SUPPRESS_MS &&
-              !(remoteActionRef.current.type === "seek" && Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS)
-            ) {
-              if (parsed > 0) iframeHasPlayedRef.current = true;
-              latestSecondsRef.current = parsed;
-              persistMarker(parsed, false);
-            }
-            return;
+            return Number.isFinite(parsed) && parsed >= 0
+              ? { eventName: "timeupdate", seconds: parsed, totalDuration: null }
+              : null;
           }
-          return;
+          if (
+            lower === "pause" ||
+            lower === "play" ||
+            lower === "playing" ||
+            lower === "start" ||
+            lower === "seeking" ||
+            lower === "seek" ||
+            lower === "seeked" ||
+            lower === "ended" ||
+            lower === "finish" ||
+            lower === "complete"
+          ) {
+            return { eventName: lower, seconds: null, totalDuration: null };
+          }
+          return null;
         }
       }
 
-      if (!data || typeof data !== "object") return;
+      if (!data || typeof data !== "object") return null;
       const record = data as PlayerMessagePayload;
 
       let eventName = "";
       let seconds: number | null = null;
       let totalDuration: number | null = null;
-
-      const toValidSeconds = (v: unknown): number | null => {
-        if (typeof v === "number" && Number.isFinite(v) && v >= 0) return v;
-        if (typeof v === "string") {
-          const p = parseFloat(v);
-          if (Number.isFinite(p) && p >= 0) return p;
-        }
-        return null;
-      };
 
       if (typeof record.event === "object" && record.event !== null) {
         const evObj = record.event;
@@ -1373,7 +1370,6 @@ function WatchPage() {
         eventName = record.type.toLowerCase();
       }
 
-      // Fallback search for seconds in any payload object (including nested vixsrc data)
       if (seconds === null) {
         const evAny = record.event as Record<string, unknown> | undefined;
         const dataAny = record.data as Record<string, unknown> | undefined;
@@ -1404,7 +1400,6 @@ function WatchPage() {
         }
       }
 
-      // Fallback search for total duration
       if (totalDuration === null) {
         const candidates = [record, record.data, record.event, record.info, record.payload];
         for (const cand of candidates) {
@@ -1419,28 +1414,182 @@ function WatchPage() {
         }
       }
 
-      // Handle video completion
+      if (!eventName && seconds === null) return null;
+      return { eventName, seconds, totalDuration };
+    };
+
+    const handlePlayerMessage = (event: MessageEvent) => {
+      // Ignore self-dispatched messages; allow nested player iframes inside the embed provider
+      if (event.source === window) return;
+
+      const raw = event.data;
+      if (!raw) return;
+
+      // Ignore React DevTools / webpack / unrelated messages
+      if (
+        typeof raw === "object" &&
+        "source" in raw &&
+        typeof (raw as Record<string, unknown>)["source"] === "string" &&
+        String((raw as Record<string, unknown>)["source"]).startsWith("react-devtools")
+      ) {
+        return;
+      }
+
+      const parsed = parsePlayerMessage(raw);
+      if (!parsed) return;
+      const { eventName, seconds, totalDuration } = parsed;
+
+      if (totalDuration !== null && totalDuration > 0) {
+        lastKnownDurationRef.current = totalDuration;
+      }
+
+      const scheduleLocalSeekBroadcast = (sec: number) => {
+        if (!Number.isFinite(sec) || sec < 0) return;
+        latestSecondsRef.current = sec;
+        persistMarker(sec, true);
+        lastSeekActivityAtRef.current = Date.now();
+        if (pauseDebounceRef.current) {
+          clearTimeout(pauseDebounceRef.current);
+          pauseDebounceRef.current = null;
+        }
+        const suppressBroadcast =
+          !party.room ||
+          party.isRemoteSyncingRef.current ||
+          Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS ||
+          (remoteActionRef.current.type === "seek" &&
+            Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS);
+        if (suppressBroadcast) return;
+
+        if (localSeekDebounceRef.current) {
+          clearTimeout(localSeekDebounceRef.current);
+        }
+        localSeekDebounceRef.current = setTimeout(() => {
+          localSeekDebounceRef.current = null;
+          if (
+            party.isRemoteSyncingRef.current ||
+            Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS
+          ) {
+            return;
+          }
+          const finalSec = latestSecondsRef.current ?? sec;
+          lastSeekActivityAtRef.current = Date.now();
+          party.sendSeek(finalSec);
+        }, 450);
+      };
+
+      const scheduleLocalPlayBroadcast = () => {
+        if (pauseDebounceRef.current) {
+          clearTimeout(pauseDebounceRef.current);
+          pauseDebounceRef.current = null;
+        }
+        if (!party.room) return;
+        if (localPlayDebounceRef.current) {
+          clearTimeout(localPlayDebounceRef.current);
+        }
+        const waitMs =
+          pendingSeekEventAtRef.current > 0 && Date.now() - pendingSeekEventAtRef.current < 1500
+            ? 450
+            : 250;
+        localPlayDebounceRef.current = setTimeout(() => {
+          localPlayDebounceRef.current = null;
+          if (
+            party.isRemoteSyncingRef.current ||
+            Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS
+          ) {
+            return;
+          }
+          // Cancel any overlapping seek debounce; PLAY carries the latest timestamp
+          if (localSeekDebounceRef.current) {
+            clearTimeout(localSeekDebounceRef.current);
+            localSeekDebounceRef.current = null;
+          }
+          const targetSec = latestSecondsRef.current ?? 0;
+          party.sendPlay(targetSec);
+        }, waitMs);
+      };
+
+      const scheduleDebouncedPause = (curSec: number) => {
+        if (localPlayDebounceRef.current) {
+          clearTimeout(localPlayDebounceRef.current);
+          localPlayDebounceRef.current = null;
+        }
+        if (!iframeStartupRef.current.hasStartedPlaying) {
+          return;
+        }
+        if (Date.now() - lastSeekActivityAtRef.current < 1600) {
+          return;
+        }
+        if (pauseDebounceRef.current) {
+          clearTimeout(pauseDebounceRef.current);
+        }
+        pauseDebounceRef.current = setTimeout(() => {
+          pauseDebounceRef.current = null;
+          if (isEndedRef.current) return;
+          if (
+            Date.now() - lastSeekActivityAtRef.current < 1600 ||
+            localSeekDebounceRef.current !== null ||
+            (pendingSeekEventAtRef.current > 0 && Date.now() - pendingSeekEventAtRef.current < 2500)
+          ) {
+            return;
+          }
+          const targetSec = latestSecondsRef.current ?? curSec;
+          const knownDur = lastKnownDurationRef.current;
+          if (knownDur > 0 && targetSec >= knownDur - 3) {
+            setIsEnded(true);
+            isEndedRef.current = true;
+            setIsLocalPlaying(false);
+            isLocalPlayingRef.current = false;
+            saveCompletedMarkerToStorage();
+            return;
+          }
+          isRoomPausedRef.current = true;
+          // Keep iframe mounted on local pause so user can still scrub timeline or press play inside iframe
+          setIsLocalPlaying(false);
+          isLocalPlayingRef.current = false;
+          if (Number.isFinite(targetSec) && targetSec >= 0) {
+            persistMarker(targetSec, true);
+          }
+          const suppressBroadcast =
+            party.isRemoteSyncingRef.current ||
+            Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS ||
+            (remoteActionRef.current.type === "pause" &&
+              Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS);
+          if (!suppressBroadcast && party.room && Number.isFinite(targetSec)) {
+            party.sendPause(targetSec);
+          }
+        }, 750);
+      };
+
+      // 1. Video completion
       if (eventName === "ended" || eventName === "complete" || eventName === "finish") {
         if (pauseDebounceRef.current) {
           clearTimeout(pauseDebounceRef.current);
           pauseDebounceRef.current = null;
         }
+        if (localSeekDebounceRef.current) {
+          clearTimeout(localSeekDebounceRef.current);
+          localSeekDebounceRef.current = null;
+        }
+        if (localPlayDebounceRef.current) {
+          clearTimeout(localPlayDebounceRef.current);
+          localPlayDebounceRef.current = null;
+        }
+        pendingSeekEventAtRef.current = 0;
         setIsEnded(true);
         isEndedRef.current = true;
         setIsLocalPlaying(false);
         isLocalPlayingRef.current = false;
-        clearCompletedMarker();
-        persistMarker(0, true);
+        saveCompletedMarkerToStorage();
         return;
       }
 
-      const durationLimit = totalDuration || playbackDurationSeconds;
-      if (seconds !== null && durationLimit > 0 && seconds >= durationLimit - 10) {
-        clearCompletedMarker();
-        persistMarker(0, true);
+      // Update saved marker to 0 if near the actual end, without resetting latestSecondsRef
+      const knownDur = lastKnownDurationRef.current;
+      if (seconds !== null && knownDur > 0 && seconds >= knownDur - 8) {
+        saveCompletedMarkerToStorage();
       }
 
-      // Handle seek events (mouse drag/click on progress bar)
+      // 2. Seek events (Vixsrc sends "seeked" with currentTime=NaN -> seconds=null!)
       if (eventName === "seeked" || eventName === "seek" || eventName === "seeking") {
         if (pauseDebounceRef.current) {
           clearTimeout(pauseDebounceRef.current);
@@ -1448,45 +1597,44 @@ function WatchPage() {
         }
         setIsEnded(false);
         isEndedRef.current = false;
-        const curSec = seconds ?? latestSecondsRef.current;
-        if (curSec === null || !Number.isFinite(curSec) || curSec < 0) return;
-        latestSecondsRef.current = curSec;
-        persistMarker(curSec, true);
+        lastSeekActivityAtRef.current = Date.now();
 
-        const isStartupSeek =
-          isStartupWindow &&
-          pendingIframeStartupRef.current.key === vixsrcIframeKey &&
-          pendingIframeStartupRef.current.expectedSeekTime !== undefined;
-        if (isStartupSeek) {
-          pendingIframeStartupRef.current.expectedSeekTime = undefined;
+        const startup = iframeStartupRef.current;
+        const inStartupSettle =
+          !startup.hasStartedPlaying ||
+          (startup.playingSince > 0 && Date.now() - startup.playingSince < 2000);
+        if (inStartupSettle && (seconds === null || Math.abs(seconds - startup.targetTime) <= 5)) {
           return;
         }
 
-        const suppressBroadcast =
-          party.isRemoteSyncingRef.current ||
-          Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS ||
-          (remoteActionRef.current.type === "seek" && Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS);
-        if (!suppressBroadcast && party.room) {
-          lastLocalSeekBroadcastRef.current = Date.now();
-          party.sendSeek(curSec);
+        if (seconds !== null && Number.isFinite(seconds) && seconds >= 0) {
+          pendingSeekEventAtRef.current = 0;
+          scheduleLocalSeekBroadcast(seconds);
+        } else {
+          // Do NOT broadcast latestSecondsRef (that is the old pre-seek timestamp);
+          // wait for the upcoming timeupdate carrying the true post-seek currentTime.
+          pendingSeekEventAtRef.current = Date.now();
         }
         return;
       }
 
-      // Handle pause events
+      // 3. Pause events
       if (eventName === "pause") {
         const curSec = seconds ?? latestSecondsRef.current ?? 0;
         const isNearEnd =
           isEndedRef.current ||
-          (totalDuration !== null && totalDuration > 0 && curSec >= totalDuration - 3);
+          (knownDur > 0 && curSec >= knownDur - 3);
 
         if (isNearEnd) {
           setIsEnded(true);
           isEndedRef.current = true;
           setIsLocalPlaying(false);
           isLocalPlayingRef.current = false;
-          clearCompletedMarker();
-          persistMarker(0, true);
+          saveCompletedMarkerToStorage();
+          return;
+        }
+
+        if (!iframeStartupRef.current.hasStartedPlaying) {
           return;
         }
 
@@ -1499,104 +1647,134 @@ function WatchPage() {
           persistMarker(curSec, true);
         }
 
-        const isStartupPause =
-          isStartupWindow &&
-          pendingIframeStartupRef.current.key === vixsrcIframeKey &&
-          pendingIframeStartupRef.current.expectedAutoplay === false;
-        if (isStartupPause) {
-          pendingIframeStartupRef.current.expectedAutoplay = undefined;
-          return;
-        }
-
         scheduleDebouncedPause(curSec);
         return;
       }
 
-      // Handle play events
+      // 4. Play events
       if (eventName === "play" || eventName === "playing" || eventName === "start") {
         if (pauseDebounceRef.current) {
           clearTimeout(pauseDebounceRef.current);
           pauseDebounceRef.current = null;
         }
-        iframeHasPlayedRef.current = true;
+        const wasRoomPaused = isRoomPausedRef.current;
         setIsEnded(false);
         isEndedRef.current = false;
         isRoomPausedRef.current = false;
         setIsPausedByRemote(false);
+        isPausedByRemoteRef.current = false;
         setIsLocalPlaying(true);
         isLocalPlayingRef.current = true;
 
-        const isStartupPlay =
-          isStartupWindow &&
-          pendingIframeStartupRef.current.key === vixsrcIframeKey &&
-          pendingIframeStartupRef.current.expectedAutoplay === true;
-        if (isStartupPlay) {
-          pendingIframeStartupRef.current.expectedAutoplay = undefined;
-          return;
+        const startup = iframeStartupRef.current;
+        if (!startup.hasStartedPlaying) {
+          startup.hasStartedPlaying = true;
+          startup.playingSince = Date.now();
+          const wasExpectedAutoplay = startup.expectedAutoplay;
+          startup.expectedAutoplay = false;
+          if (wasExpectedAutoplay && !wasRoomPaused) {
+            // Startup autoplay (or delayed mobile tap after blocked autoplay) in an already-playing room
+            return;
+          }
         }
 
         const isSuppressed =
           party.isRemoteSyncingRef.current ||
           Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS ||
-          (remoteActionRef.current.type === "play" && Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS);
-
+          (remoteActionRef.current.type === "play" &&
+            Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS);
         if (isSuppressed) {
           return;
         }
 
-        const curSec =
-          seconds !== null && Date.now() - lastRemoteReloadRef.current >= REMOTE_SUPPRESS_MS
-            ? seconds
-            : (latestSecondsRef.current ?? seconds ?? 0);
-        latestSecondsRef.current = curSec;
-        if (party.room) {
-          party.sendPlay(curSec);
+        if (seconds !== null && Date.now() - lastRemoteReloadRef.current >= REMOTE_SUPPRESS_MS) {
+          latestSecondsRef.current = seconds;
+        }
+
+        // Only broadcast PLAY if the room was actually paused (avoid echo during scrub/buffering)
+        if (wasRoomPaused && party.room) {
+          scheduleLocalPlayBroadcast();
         }
         return;
       }
 
-      // Handle timeupdate events (sent continuously while playing)
+      // 5. Timeupdate events (Vixsrc's primary source of valid currentTime!)
       if (eventName === "timeupdate" || eventName === "time" || seconds !== null) {
-        if (seconds !== null && Number.isFinite(seconds) && seconds >= 0) {
-          if (seconds > 0) {
-            iframeHasPlayedRef.current = true;
-          }
-          // Ignore trailing timeupdate messages from an unloading iframe or 0s during reload
-          const inReloadSuppression =
-            Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS ||
-            (remoteActionRef.current.type === "seek" &&
-              Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS);
-          if (inReloadSuppression) {
+        if (seconds === null || !Number.isFinite(seconds) || seconds < 0) return;
+
+        const startup = iframeStartupRef.current;
+        // Ignore pre-seek 0s emitted while a newly mounted iframe is still seeking to targetTime
+        if (
+          !startup.hasStartedPlaying &&
+          startup.targetTime > 3 &&
+          seconds < 3 &&
+          Date.now() - startup.mountedAt < 8000
+        ) {
+          return;
+        }
+
+        if (!startup.hasStartedPlaying) {
+          if (Date.now() - startup.mountedAt < 1800 && startup.targetTime > 3 && Math.abs(seconds - startup.targetTime) > 10) {
             return;
           }
-
-          const prevSec = latestSecondsRef.current;
-          latestSecondsRef.current = seconds;
-          persistMarker(seconds, false);
-
-          // Detect manual backward or forward timeline jump if the embed player did not emit "seeked"
           if (
-            party.room &&
-            prevSec !== null &&
-            prevSec > 0 &&
-            (seconds < prevSec - 2.5 || seconds > prevSec + 4.5) &&
-            !party.isRemoteSyncingRef.current &&
-            Date.now() - lastLocalSeekBroadcastRef.current > 1200
+            Date.now() - lastRemoteReloadRef.current >= REMOTE_SUPPRESS_MS &&
+            (!startup.expectedAutoplay || (seconds > 0 && Math.abs(seconds - startup.targetTime) <= 10))
           ) {
-            if (pauseDebounceRef.current) {
-              clearTimeout(pauseDebounceRef.current);
-              pauseDebounceRef.current = null;
-            }
-            lastLocalSeekBroadcastRef.current = Date.now();
-            party.sendSeek(seconds);
+            startup.hasStartedPlaying = true;
+            startup.playingSince = Date.now();
+            startup.expectedAutoplay = false;
           }
         }
-        return;
+
+        // Ignore trailing timeupdate messages from an unloading iframe during remote reload
+        if (Date.now() - lastRemoteReloadRef.current < REMOTE_SUPPRESS_MS) {
+          return;
+        }
+
+        const prevSec = latestSecondsRef.current;
+        latestSecondsRef.current = seconds;
+        persistMarker(seconds, false);
+
+        const hasPendingSeekEvent =
+          pendingSeekEventAtRef.current > 0 &&
+          Date.now() - pendingSeekEventAtRef.current < 2500;
+        const jumpedBackward = prevSec !== null && prevSec > 0 && seconds < prevSec - 2.0;
+        const jumpedForward = prevSec !== null && seconds > prevSec + 3.5;
+        const isNearStartupTarget =
+          startup.playingSince > 0 &&
+          Date.now() - startup.playingSince < 2000 &&
+          Math.abs(seconds - startup.targetTime) <= 6;
+
+        if (
+          party.room &&
+          startup.hasStartedPlaying &&
+          !isNearStartupTarget &&
+          !party.isRemoteSyncingRef.current &&
+          !(remoteActionRef.current.type === "seek" && Date.now() - remoteActionRef.current.ts < REMOTE_SUPPRESS_MS) &&
+          (hasPendingSeekEvent || jumpedBackward || jumpedForward)
+        ) {
+          pendingSeekEventAtRef.current = 0;
+          if (pauseDebounceRef.current) {
+            clearTimeout(pauseDebounceRef.current);
+            pauseDebounceRef.current = null;
+          }
+          if (localPlayDebounceRef.current) {
+            // Pending PLAY broadcast will carry this updated seconds value
+            return;
+          }
+          scheduleLocalSeekBroadcast(seconds);
+        }
       }
     };
 
     window.addEventListener("message", handlePlayerMessage);
-    return () => window.removeEventListener("message", handlePlayerMessage);
+    return () => {
+      window.removeEventListener("message", handlePlayerMessage);
+      if (pauseDebounceRef.current) clearTimeout(pauseDebounceRef.current);
+      if (localSeekDebounceRef.current) clearTimeout(localSeekDebounceRef.current);
+      if (localPlayDebounceRef.current) clearTimeout(localPlayDebounceRef.current);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [markerLoaded, slug, title, season, episode, party]);
 
@@ -1627,97 +1805,6 @@ function WatchPage() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          {party.room ? (
-            <>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => {
-                  const cur = latestSecondsRef.current ?? party.room?.state?.time ?? 0;
-                  const target = Math.max(0, Math.floor(cur - 10));
-                  latestSecondsRef.current = target;
-                  lastLocalSeekBroadcastRef.current = Date.now();
-                  persistMarker(target, true);
-                  party.sendSeek(target);
-                  if (playlistUrl && !hlsFailed) {
-                    hlsPlayerRef.current?.seek(target);
-                  } else {
-                    reloadVixsrc(target, isLocalPlayingRef.current);
-                  }
-                }}
-                className="gap-1 px-2.5 text-xs font-medium"
-                title="Torna indietro di 10 secondi per tutti"
-              >
-                <Rewind className="size-3.5" />
-                <span>-10s</span>
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => {
-                  const cur = latestSecondsRef.current ?? party.room?.state?.time ?? 0;
-                  if (isLocalPlaying && !isPausedByRemote) {
-                    isRoomPausedRef.current = true;
-                    setIsPausedByRemote(true);
-                    setIsLocalPlaying(false);
-                    isLocalPlayingRef.current = false;
-                    party.sendPause(cur);
-                    if (playlistUrl && !hlsFailed) {
-                      hlsPlayerRef.current?.pause();
-                    }
-                  } else {
-                    isRoomPausedRef.current = false;
-                    setIsPausedByRemote(false);
-                    setIsLocalPlaying(true);
-                    isLocalPlayingRef.current = true;
-                    party.sendPlay(cur);
-                    if (playlistUrl && !hlsFailed) {
-                      hlsPlayerRef.current?.seek(cur);
-                      hlsPlayerRef.current?.play();
-                    } else {
-                      reloadVixsrc(cur, true);
-                    }
-                  }
-                }}
-                className="gap-1.5 text-xs font-medium"
-              >
-                {isLocalPlaying && !isPausedByRemote ? (
-                  <>
-                    <Pause className="size-3.5 fill-current" />
-                    <span>Pausa</span>
-                  </>
-                ) : (
-                  <>
-                    <Play className="size-3.5 fill-current" />
-                    <span>Riprendi</span>
-                  </>
-                )}
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => {
-                  const cur = latestSecondsRef.current ?? party.room?.state?.time ?? 0;
-                  const target = Math.max(0, Math.floor(cur + 10));
-                  latestSecondsRef.current = target;
-                  lastLocalSeekBroadcastRef.current = Date.now();
-                  persistMarker(target, true);
-                  party.sendSeek(target);
-                  if (playlistUrl && !hlsFailed) {
-                    hlsPlayerRef.current?.seek(target);
-                  } else {
-                    reloadVixsrc(target, isLocalPlayingRef.current);
-                  }
-                }}
-                className="gap-1 px-2.5 text-xs font-medium"
-                title="Avanti di 10 secondi per tutti"
-              >
-                <span>+10s</span>
-                <FastForward className="size-3.5" />
-              </Button>
-            </>
-          ) : null}
-
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
@@ -1959,10 +2046,11 @@ function WatchPage() {
                             isEndedRef.current = false;
                             isRoomPausedRef.current = false;
                             setIsPausedByRemote(false);
+                            isPausedByRemoteRef.current = false;
                             setIsLocalPlaying(true);
                             isLocalPlayingRef.current = true;
                             latestSecondsRef.current = 0;
-                            party.sendSeek(0);
+                            lastReloadMetaRef.current = null;
                             party.sendPlay(0);
                             reloadVixsrc(0, true);
                           }}
@@ -1991,8 +2079,10 @@ function WatchPage() {
                             const cur = latestSecondsRef.current ?? party.room?.state?.time ?? 0;
                             isRoomPausedRef.current = false;
                             setIsPausedByRemote(false);
+                            isPausedByRemoteRef.current = false;
                             setIsLocalPlaying(true);
                             isLocalPlayingRef.current = true;
+                            lastReloadMetaRef.current = null;
                             party.sendPlay(cur);
                             if (!playlistUrl || hlsFailed) {
                               reloadVixsrc(cur, true);
