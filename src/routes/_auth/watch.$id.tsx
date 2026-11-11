@@ -711,6 +711,11 @@ function WatchPage() {
 
   const onRoomNotFound = useCallback(() => {
     setPartyCode(null);
+    isRoomPausedRef.current = false;
+    setIsPausedByRemote(false);
+    isPausedByRemoteRef.current = false;
+    setIsEnded(false);
+    isEndedRef.current = false;
     try {
       sessionStorage.removeItem("cinemagic_watch_party");
     } catch {}
@@ -1075,6 +1080,11 @@ function WatchPage() {
 
   const handleLeaveParty = useCallback(() => {
     isLeavingPartyRef.current = true;
+    isRoomPausedRef.current = false;
+    setIsPausedByRemote(false);
+    isPausedByRemoteRef.current = false;
+    setIsEnded(false);
+    isEndedRef.current = false;
     try {
       sessionStorage.removeItem("cinemagic_watch_party");
     } catch {}
