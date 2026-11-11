@@ -172,12 +172,11 @@ def resolve_party_participant(
 
 
 def generate_room_code(length: int = 6) -> str:
-    """Generate a friendly, collision-resistant room code like 'CINE-42' or 'WZ8492'."""
-    alphabet = string.ascii_uppercase + string.digits
-    # Avoid ambiguous characters like 0, O, 1, I
-    clean_alphabet = "".join(c for c in alphabet if c not in "0O1I")
-    prefix = "".join(secrets.choice(clean_alphabet) for _ in range(length // 2))
-    suffix = "".join(secrets.choice(string.digits) for _ in range(length // 2))
+    """Generate a friendly, collision-resistant room code like 'KMV492' (letters + digits)."""
+    # Prefix uses unambiguous letters only so codes never look like numeric/scientific notation in URL parsers
+    clean_letters = "".join(c for c in string.ascii_uppercase if c not in "OI")
+    prefix = "".join(secrets.choice(clean_letters) for _ in range(length // 2))
+    suffix = "".join(secrets.choice(string.digits) for _ in range(length - (length // 2)))
     return f"{prefix}{suffix}"
 
 
