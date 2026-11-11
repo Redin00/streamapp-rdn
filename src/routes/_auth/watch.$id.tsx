@@ -1578,18 +1578,14 @@ function WatchPage() {
             saveCompletedMarkerRef.current();
             return;
           }
-          const p = partyRef.current;
           isRoomPausedRef.current = true;
-          if (p.room && (hlsFailed || !playlistUrl)) {
-            setIsPausedByRemote(true);
-            isPausedByRemoteRef.current = true;
-            lastReloadMetaRef.current = null;
-          }
+          // Keep iframe mounted on local pause so user can still scrub timeline or press play inside iframe
           setIsLocalPlaying(false);
           isLocalPlayingRef.current = false;
           if (Number.isFinite(targetSec) && targetSec >= 0) {
             persistMarkerRef.current(targetSec, true);
           }
+          const p = partyRef.current;
           const suppressBroadcast =
             p.isRemoteSyncingRef.current ||
             (lastRemoteReloadRef.current > 0 &&
@@ -1599,7 +1595,7 @@ function WatchPage() {
           if (!suppressBroadcast && p.room && Number.isFinite(targetSec)) {
             p.sendPause(targetSec);
           }
-        }, 350);
+        }, 250);
       };
 
       // 1. Video completion
