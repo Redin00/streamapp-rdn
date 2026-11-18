@@ -72,7 +72,9 @@ Copy `.env.example` to `.env` in the repository root — the app works out-of-th
 | `SC_ADMIN_PASSWORD`  | `admin123`                         | Initial password for the first admin profile           |
 | `SC_SESSION_DAYS`    | `30`                               | How long a session token stays valid                   |
 | `SC_LOCKOUT_MINUTES` | `15`                               | Lockout after five failed sign-ins                     |
-| `SC_BASE_URL`        | empty                              | Public base URL used for profile picture links         |
+| `SC_BASE_URL`        | empty                              | Public base URL of the Python service used to build uploaded profile picture URLs (e.g. `https://api.example.com`) |
+| `SC_UPLOAD_DIR`      | `python-service/uploads`           | Directory where uploaded profile pictures are saved    |
+| `SC_MAX_PROFILE_PICTURE_MB` | `2`                         | Maximum profile picture upload size in MB              |
 
 > [!NOTE]
 > `SC_VIXSRC_DOMAIN` in `.env` serves as the initial seed and fallback. When changed via the `/admin` UI or automatically via redirect detection, the active domain is stored in SQLite (`app_settings`) and overrides the `.env` value.
@@ -91,9 +93,31 @@ Accounts, sessions, saved titles and watch history all live in the SQLite file a
 `SC_DB_PATH`, so back that file up and keep it out of the repository. `/library`
 shows what the signed-in profile saved and recently played.
 
-If you want to host the project, remember to set the variable `SC_BASE_URL` in `.env` for the profile pictures to
-be reachable, because it will work as an API for the profile pictures. If you don't care 
-about this, simply skip this and follow the standard process to deploy the project.
+### Profile Pictures & `SC_BASE_URL`
+
+Profiles support setting a picture either by **external URL** (`POST /auth/me/picture` or `POST /accounts/{id}/picture`) or by **uploading a JPEG/PNG image** (`POST /auth/me/picture/upload` or `POST /accounts/{id}/picture/upload`, max `SC_MAX_PROFILE_PICTURE_MB`, resized to 512×512 with EXIF stripped).
+
+Uploaded files are saved to `SC_UPLOAD_DIR` (default `python-service/uploads`) as `<account_id>.<ext>` and served by the Python service at:
+
+```text
+GET /profile-pictures/<filename>
+```
+
+When an image is uploaded, the backend stores the full image URL in SQLite (`accounts.profile_picture`) using:
+
+```text
+<SC_BASE_URL>/profile-pictures/<filename>
+```
+
+Because the Node/SSR frontend calls the Python service internally (default `http://localhost:8000`), leaving `SC_BASE_URL` empty makes the backend fall back to `request.base_url` (`http://localhost:8000`), which only works when the browser runs on the same machine as the server.
+
+**When hosting on a LAN, VPS, Docker, or behind a reverse proxy:**
+
+1. Set `SC_BASE_URL` in `.env` to the **browser-reachable** base URL that routes to the Python service (without `/profile-pictures` at the end):
+   - **Exposed Python port (LAN/VPS):** `SC_BASE_URL=http://192.168.1.50:8000`
+   - **Reverse proxy (recommended):** Route `/profile-pictures/` to the Python service (`http://127.0.0.1:8000/profile-pictures/`) and set `SC_BASE_URL=https://your-domain.com` (or if proxying under a subpath like `/api`, route `/api/profile-pictures/` -> `/profile-pictures/` and set `SC_BASE_URL=https://your-domain.com/api`).
+2. **Restart the Python service** after changing `.env` (`SC_BASE_URL` is read on startup).
+3. **Re-upload existing profile pictures** if they were uploaded before `SC_BASE_URL` was set, because the previously generated `http://localhost:8000/...` URL is already stored in SQLite.
 
 ## Playback
 
